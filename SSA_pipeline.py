@@ -9,7 +9,7 @@ import os
 import pandas as pd
 import json
 from tqdm import tqdm
-from Engine.SSA import SSA # Import the updated SSA class
+from SSA import SSA  # Import the updated SSA class
 import gc  # For garbage collection
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -87,19 +87,19 @@ def run_analysis_pipeline(params_file):
     output_dir = os.path.join(params["csv_directory"], "Analysis")
     os.makedirs(output_dir, exist_ok=True)
 
+    # Z-score normalization
+    if not params.get("avoid_z_normalization", False):
+        print("Performing Z-score normalization...")
+        ssa.z_normalize_features()
+    else:
+        print("Skipping Z-score normalization...")
+
     # Remove outliers from the control class
     if not params.get("avoid_outlier_removal", False):
         print("Removing outliers from control class...")
         ssa.remove_outliers_control()
     else:
         print("Skipping outlier removal...")
-
-    # Normalize features by the control class
-    if not params.get("avoid_normalization_HC", False):
-        print("Normalizing features by control class...")
-        ssa.normalize_features_by_control()
-    else:
-        print("Skipping normalization for hierarchical clustering...")
 
     # Perform hierarchical clustering analysis
     if not params.get("avoid_hierarchical_clustering", False):
@@ -108,13 +108,6 @@ def run_analysis_pipeline(params_file):
         ssa.interactive_hierarchical_clustering()
     else:
         print("Skipping hierarchical clustering...")
-
-    # Z-score normalization
-    if not params.get("avoid_normalization_HC", False):
-        print("Performing Z-score normalization...")
-        ssa.z_normalize_features()
-    else:
-        print("Skipping Z-score normalization...")
 
     # Statistical analysis
     if not params.get("avoid_SA", False):
@@ -148,6 +141,7 @@ def run_analysis_pipeline(params_file):
         try:
             print("Generating PCA plots...")
             ssa.plot_pca()
+            #ssa.plot_ellipse_pca()
         except Exception as e:
             print(f"Error during PCA plot generation: {e}")
     else:
@@ -172,6 +166,28 @@ def run_analysis_pipeline(params_file):
             print(f"Error during boxplot generation: {e}")
     else:
         print("Skipping boxplots...")
+    
+    # Waterfall
+    if not params.get("avoid_waterfall", False):
+        try:
+            print("Generating Waterfall plots...")
+            #ssa.plot_waterfall()
+            ssa.interactive_waterfall_plot()
+        except Exception as e:
+            print(f"Error during waterfall plots generation: {e}")
+    else:
+        print("Skipping Waterfall plots...")
+
+    # Feature Ditributions
+
+    if not params.get("avoid_feature_distributions", False):
+        try:
+            print("Generating Feature Ditribution plots...")
+            ssa.plot_feature_distributions()
+        except Exception as e:
+            print(f"Error during Feature Ditribution plots generation: {e}")
+    else:
+        print("Skipping Feature Ditributions...")
 
     print("Analysis pipeline completed. Results saved to:", output_dir)
 

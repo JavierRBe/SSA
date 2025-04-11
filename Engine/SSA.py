@@ -55,16 +55,22 @@ Key Components:
 """
 
 import os
+import psutil
+import copy
 import pandas as pd
+from pandas.plotting import parallel_coordinates
 import numpy as np
 from tqdm import tqdm
+from joblib import Parallel, delayed
 import warnings
 import csv
 import multiprocessing as mp
+import queue
 from multiprocessing import Pool
 from sklearn.decomposition import PCA
 from sklearn.decomposition import KernelPCA
 from matplotlib.lines import Line2D
+from matplotlib.colors import to_hex
 from pyrqa.time_series import TimeSeries
 from pyrqa.settings import Settings
 from pyrqa.computation import RQAComputation
@@ -77,6 +83,7 @@ from sklearn.cluster import KMeans
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from statsmodels.stats.multitest import multipletests
+from scipy.stats import gaussian_kde, chi2
 from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
 from scipy.spatial.distance import pdist
 import matplotlib.colors as mcolors
@@ -88,6 +95,7 @@ import plotly.io as pio
 import plotly.figure_factory as ff
 import itertools
 import random
+from statsmodels.stats.multitest import multipletests
 from scipy.stats import ttest_ind, ttest_rel, mannwhitneyu, wilcoxon, kruskal, friedmanchisquare, pearsonr, spearmanr, kendalltau, levene, bartlett, ks_2samp
 from joblib import Parallel, delayed
 import gc
@@ -122,6 +130,9 @@ class SSA:
             col for col in data.columns
             if col not in self.metadata_columns + self.core_columns + [self.combined_class_column]
         ]
+
+        self.apply_well_filter()
+
         self.features = data[self.feature_columns]
         self.data_dict = {
             cls: df for cls, df in data.groupby(self.combined_class_column)
@@ -131,6 +142,45 @@ class SSA:
         self.anomaly_scores_df = None
         self.ifa = self.IFA(self)  # Instantiate the IFA subclass
         
+    def apply_well_filter(self):
+        """
+        Applies well-level filtering based on a specified feature and value range.
+        Wells outside the specified range are dropped entirely.
+
+        This uses `self.params["well_filter"]` for configuration.
+        """
+        well_filter = self.params.get("well_filter", {})
+        if not well_filter.get("enabled", False):
+            print(" Well filter is disabled. Skipping well filtering step.")
+            return
+
+        target_classes = well_filter.get("classes", [])
+        filter_feature = well_filter.get("feature", None)
+        value_range = well_filter.get("value_range", [])
+
+        if not (target_classes and filter_feature and len(value_range) == 2):
+            print("⚠️ Well filter is enabled, but configuration is incomplete. Skipping.")
+            return
+
+        min_value, max_value = value_range
+        print(f" Applying well filter: {filter_feature} in range {min_value} - {max_value} for classes: {', '.join(target_classes)}")
+
+        initial_count = len(self.data)
+
+        # Filter only wells from target classes
+        mask_target_classes = self.data[self.combined_class_column].isin(target_classes)
+
+        # Keep only wells where the feature value is within the range
+        mask_within_range = self.data[filter_feature].between(min_value, max_value)
+
+        # Combine the two conditions (only applies filter to target classes)
+        mask_keep = ~mask_target_classes | (mask_target_classes & mask_within_range)
+
+        # Apply the mask to self.data
+        self.data = self.data[mask_keep].reset_index(drop=True)
+
+        final_count = len(self.data)
+        print(f" Well filter applied. {initial_count - final_count} wells removed.")
 
     def remove_outliers_control(self):
         """
@@ -219,160 +269,173 @@ class SSA:
 
     def normalize_features_by_control(self):
         """
-        Normalize all feature columns in the dataset by subtracting the control class mean.
-        Only numeric feature columns are used for normalization.
+        Returns a new dataset where all feature values are normalized relative to the control class.
+        This does NOT modify self.data_dict; instead, it creates a temporary dataset for hierarchical clustering.
+
+        Normalization: 
+        - Uses already Z-normalized data to maintain correct scaling.
+        - Subtracts the control mean from each feature (so control mean should be 0).
         """
-        # Ensure only numeric columns are used
-        control_features = self.data_dict[self.control_class][self.feature_columns].select_dtypes(include=[np.number])
+
+        # Create a deep copy of self.data_dict to avoid modifying original data
+        normalized_data_dict = {cls: df.copy() for cls, df in self.data_dict.items()}
+
+        # Extract Z-normalized features from control
+        control_df = normalized_data_dict[self.control_class][self.feature_columns]
+        control_features = control_df.select_dtypes(include=[np.number])
+
+        # Compute means from Z-normalized data
         control_mean = control_features.mean()
 
-        for cls, df in self.data_dict.items():
-            # Select numeric feature columns for the current class
+        # Apply normalization to each class separately
+        for cls, df in normalized_data_dict.items():
+
+            # Select numeric feature columns
             numeric_features = df[self.feature_columns].select_dtypes(include=[np.number])
 
-            # Subtract the control mean from the numeric features
-            normalized_features = numeric_features - control_mean
+            # Subtract the control mean directly from the numeric features
+            df[self.feature_columns] = numeric_features - control_mean
 
-            # Update the original DataFrame with the normalized features
-            df.update(normalized_features)
-        
-        del control_features
+
         gc.collect()
+
+        return normalized_data_dict  # Return a separate instance, leaving self.data_dict untouched
+
 
     def hierarchical_clustering(self):
         """
-        Perform hierarchical clustering on the dataset using the specified configuration options.
-        Ensures proper layout for title, legend, and dendrograms, and highlights specified class labels.
+        Perform hierarchical clustering with:
+        - A large pool of contrasting colors for class distinction.
+        - Adaptive color assignment to handle thousands of classes.
+        - Configurable row color mapping based on user-specified metadata column(s).
+        - Row colors provided as a DataFrame if multiple columns are specified.
+        - Ensures row_colors index matches grouped_df index for proper mapping.
         """
-        # NTS: you can pass a PandasDF as row_colors if you want multiple colour mapping
-        # Read configuration options
+        # Configuration options
         clustering_method = self.params.get("clustering_method", "ward")
         distance_metric = self.params.get("distance_metric", "euclidean")
         font_scale = self.params.get("font_scale", 1.0)
         vmin = self.params.get("vmin", -2)
         vmax = self.params.get("vmax", 2)
         normalize_features = self.params.get("normalize_features", "None")
+        row_color_columns = self.params.get("color_mapping_columns", ["metadata_treatment_1"])
+        figsize = (12, 8)
 
-        row_mapping = self.params.get("row_mapping", "None")
-        row_mapping_cmap = self.params.get("row_mapping_cmap", "None")
+        if not self.params.get("avoid_normalization_HC", False):
+            print("Normalizing features by control class...")
+            normalized_data_dict = self.normalize_features_by_control()
+        else:
+            print("Skipping normalization for hierarchical clustering...")
+            normalized_data_dict = self.data_dict
 
-        # Classes to highlight
-        control_class = self.params.get("main_control_name", [])
-        positive_class = self.params.get("positive_controls", [])
-        negative_class = self.params.get("negative_controls", [])
-        highlight_classes = self.params.get("highlight_classes", [])
-        figsize=(12, 8)
-
-        # Prepare the data
+        # ---------------------------
+        # Data Preparation
+        # ---------------------------
         dataframes = []
-        labels = []
-
-        for class_name, df in self.data_dict.items():
-            # Select only numeric feature columns
-            feature_df = df[self.feature_columns].select_dtypes(include=[np.number]).copy()
+        for class_name, df in normalized_data_dict.items():
+            feature_df = df[self.feature_columns].select_dtypes(include=[float, int]).copy()
             feature_df['class'] = class_name
-            labels.extend([class_name] * feature_df.shape[0])
             dataframes.append(feature_df)
 
-        combined_df = pd.concat(dataframes, ignore_index=True)
+        combined_df = pd.concat(dataframes, ignore_index=True).dropna(how="all", axis=1).dropna(how="all", axis=0)
 
-        # Drop rows or columns with all NaN values
-        combined_df = combined_df.dropna(how="all", axis=1).dropna(how="all", axis=0)
-
-        # Extract feature columns and group by class
         feature_columns_only = [col for col in combined_df.columns if col != 'class']
         grouped_df = combined_df.groupby('class')[feature_columns_only].mean()
+        
+        # Linkage for clustering
+        linkage_matrix = linkage(grouped_df, method=clustering_method, metric=distance_metric, optimal_ordering=True)
 
-        # Optional normalization
-        if normalize_features == "zscore":
-            grouped_df = (grouped_df - grouped_df.mean()) / grouped_df.std()
-        elif normalize_features == "minmax":
-            grouped_df = (grouped_df - grouped_df.min()) / (grouped_df.max() - grouped_df.min())
+        # ---------------------------
+        # Row Color Mapping (Class-Level Mapping)
+        # ---------------------------
+        if not isinstance(row_color_columns, list):
+            row_color_columns = [row_color_columns]
 
-        # Calculate linkage with optimal ordering
-        linkage_matrix = linkage(
-            grouped_df, method=clustering_method, metric=distance_metric, optimal_ordering=True
-        )
+        metadata_columns = [col for col in row_color_columns if col in self.data.columns]
 
-        # Adjust dendrogram parameters dynamically
-        avoid_dendrograms = self.params.get("avoid_dendrograms", False)
-        row_linkage_param = linkage_matrix if not avoid_dendrograms else None
-        col_dendrogram_ratio = 0.05 if not avoid_dendrograms else 0
-        row_dendrogram_ratio = 0.1 if not avoid_dendrograms else 0
-
-        if row_mapping:  
-            row_colors = grouped_df.index.map(row_mapping_cmap)# Future upgrade: This could be a DF instead for multiple row mapping
-        else:
+        if not metadata_columns:
+            print("Warning: Specified row_color_columns not found in metadata. Proceeding without row colors.")
             row_colors = None
+        else:
+            # Group metadata by 'class' to ensure one value per class
+            class_metadata = self.data.groupby(self.class_columns)[metadata_columns].first()
 
-        # Create the heatmap
+            # Ensure the index matches grouped_df
+            class_metadata = class_metadata.reindex(grouped_df.index)
+
+            # Check for existing *_color columns
+            existing_color_columns = [col for col in class_metadata.columns if col.endswith('_color')]
+
+            if existing_color_columns:
+                # Use existing color columns
+                row_colors = class_metadata[existing_color_columns].copy()
+            else:
+                # Generate new color columns
+                #print("No existing color columns found. Generating new color mappings.")
+
+                max_classes = 12000
+                base_palette = (
+                    sns.color_palette("tab20", 20)
+                    + sns.color_palette("Set3", 12)
+                    + sns.color_palette("Paired", 12)
+                )
+                large_palette = list(base_palette) * (max_classes // len(base_palette) + 1)
+                random.shuffle(large_palette)
+                hex_palette = [to_hex(color) for color in large_palette]
+
+                # Generate colors for each metadata column
+                for col in metadata_columns:
+                    unique_values = class_metadata[col].unique()
+                    color_map = {val: hex_palette[i % len(hex_palette)] for i, val in enumerate(unique_values)}
+                    class_metadata[f"{col}_color"] = class_metadata[col].map(color_map)
+                    self.data[f"{col}_color"] = self.data[col].map(color_map)  # Save mapping back to self.data
+
+                row_colors = class_metadata[[f"{col}_color" for col in metadata_columns]]
+
+            # Replace NaNs with white and ensure final alignment
+            row_colors = row_colors.fillna("#FFFFFF")
+            row_colors.index = grouped_df.index
+
+        # ---------------------------
+        # Heatmap and Clustermap
+        # ---------------------------
         sns.set(font_scale=font_scale)
         g = sns.clustermap(
             grouped_df,
             vmin=vmin,
             vmax=vmax,
+            cmap="RdBu_r",
             figsize=figsize,
             yticklabels=True,
             xticklabels=True,
-            dendrogram_ratio=(row_dendrogram_ratio, col_dendrogram_ratio),
-            row_linkage=row_linkage_param,
-            **({"row_colors": row_colors} if row_colors is not None else {}) 
+            row_linkage=linkage_matrix,
+            row_colors=row_colors,
+            dendrogram_ratio=(0.1, 0.05),
         )
 
-        # Adjust the title
-        g.ax_heatmap.set_title(f'Hierarchical Clustering Heatmap - Method: {clustering_method}', fontsize=16, pad=50)
+        # Title and Aesthetics
+        g.ax_heatmap.set_title(f"Hierarchical Clustering Heatmap - Method: {clustering_method}", fontsize=16, pad=50)
 
-        # Dynamically adjust the colorbar legend position and dimensions
-        longest_xlabel = max(
-            g.ax_heatmap.get_xticklabels(),
-            key=lambda lbl: lbl.get_window_extent(renderer=g.ax_heatmap.figure.canvas.get_renderer()).width
-        )
-
-        legend_width = longest_xlabel.get_window_extent(renderer=g.ax_heatmap.figure.canvas.get_renderer()).width / g.ax_heatmap.figure.dpi / g.ax_heatmap.figure.get_figwidth()
-
+        # Adjust colorbar position
         heatmap_bbox = g.ax_heatmap.get_position()
-        legend_x = heatmap_bbox.x1 + 0.02  # Slightly to the right of the y-axis labels
-        legend_y = heatmap_bbox.y0 - 0.125  # Below the x-axis labels but not overlapping
-        legend_height = 0.02  # Fixed height
-        legend_width += 0.02  # Add a slight margin for clarity
+        g.cax.set_position([heatmap_bbox.x1 + 0.02, heatmap_bbox.y0 - 0.125, 0.1, 0.02])
 
-        g.cax.set_position([legend_x, legend_y, 0.5*legend_width,5*legend_height ])
-
-        # Adjust y-axis label font size and position
+        # Format labels
         for label in g.ax_heatmap.get_yticklabels():
             label.set_size(10)
             label.set_rotation(0)
-
         for label in g.ax_heatmap.get_xticklabels():
             label.set_size(8)
             label.set_rotation(90)
 
-        # Highlight specific classes
-        clustered_order = g.dendrogram_row.reordered_ind
-        clustered_labels = [grouped_df.index[i] for i in clustered_order]
-
-        for i, label in enumerate(clustered_labels):
-            if label in highlight_classes:
-                g.ax_heatmap.get_yticklabels()[i].set_color("#E982F6")
-            elif label in negative_class:
-                g.ax_heatmap.get_yticklabels()[i].set_color("#97D285")
-            elif label in positive_class:
-                g.ax_heatmap.get_yticklabels()[i].set_color("#B30505")
-            elif label in control_class:
-                g.ax_heatmap.get_yticklabels()[i].set_color("steelblue")
-
-        # Save the ordered features
-        self.feature_order = g.data2d.columns.tolist()
-
-        # Save the plot
+        # Save plot and attributes
         output_dir = os.path.join(self.output_directory, "Hierarchical_Clustering")
         os.makedirs(output_dir, exist_ok=True)
         plot_path = os.path.join(output_dir, "Hierarchical_Clustering_Heatmap.png")
-
         plt.savefig(plot_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-        # Save necessary attributes for the interactive version
+        # Save attributes
         self.grouped_df = grouped_df
         self.data_matrix = grouped_df.values
         self.feature_names = grouped_df.columns.tolist()
@@ -382,11 +445,14 @@ class SSA:
             "figsize": figsize,
             "font_scale": font_scale,
             "vmin": vmin,
-            "vmax": vmax
+            "vmax": vmax,
         }
+
+        # Save the ordered features
+        self.feature_order = g.data2d.columns.tolist()
+
         del combined_df, grouped_df, linkage_matrix
         gc.collect()
-
 
     def interactive_hierarchical_clustering(self):
         """
@@ -407,6 +473,9 @@ class SSA:
 
         hover_reach = self.params.get("hover_reach",10)
         hover_columns = self.params.get("HC_hover_columns", [])
+
+        vmin = self.params.get("vmin", -2)
+        vmax = self.params.get("vmax", 2)
 
         # Build metadata DataFrame from self.data_dict
         # ---------------------------
@@ -499,7 +568,7 @@ class SSA:
             x=ordered_df.columns,
             y=ordered_core_well_ids,
             colorscale='inferno',
-            zmin=-2, zmax=2,
+            zmin=vmin, zmax=vmax,
             colorbar=dict(title='Z-score'),
             text=text_annotations,
             texttemplate="%{text}",
@@ -608,27 +677,96 @@ class SSA:
     def z_normalize_features(self):
         """
         Perform Z-score normalization on numeric feature columns globally across all data.
+        - Uses efficient NumPy vectorized operations instead of DataFrame `.apply()`
+        - Batch plots features to reduce overhead
         """
+        avoidplots = self.params.get("avoid_normalization_plots", False)
+        print(" Starting Z-score normalization...")
+
         # Ensure only numeric feature columns are considered
         numeric_features = self.features.select_dtypes(include=[np.number])
-        
-        # Calculate global mean and standard deviation for numeric features
-        global_means = numeric_features.mean()
-        global_stds = numeric_features.std()
 
-        # Apply Z-score normalization to each class's feature DataFrame
+        # Compute global mean & std **(NumPy Optimized)**
+        global_means = numeric_features.mean().values
+        global_stds = numeric_features.std().replace(0, 1).values  # Replace 0 std with 1
+
+        # Extract feature names
+        feature_names = numeric_features.columns.tolist()
+        feature_idx_map = {col: i for i, col in enumerate(feature_names)}
+
+        # Create output directory
+        output_dir = os.path.join(self.output_directory, "Z_Normalization")
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Track before normalization values efficiently (only required columns)
+        before_normalization = {
+            cls: df[feature_names].copy(deep=False) for cls, df in self.data_dict.items()
+        }
+
+        # **FAST NORMALIZATION - NumPy Vectorized**
         for cls, df in self.data_dict.items():
-            df[self.feature_columns] = df[self.feature_columns].apply(
-                lambda x: (x - global_means[x.name]) / global_stds[x.name] if x.name in numeric_features.columns else x
-            )
-        del numeric_features, global_means, global_stds
+            df.loc[:, feature_names] = (df[feature_names] - global_means) / global_stds
+
+        print(" Normalization completed. Generating plots...")
+
+        if avoidplots == False:
+            # **Batch Processing of Plots**
+            batch_size = 10  # Number of features per figure (adjustable)
+            num_batches = int(np.ceil(len(feature_names) / batch_size))
+
+            for batch in range(num_batches):
+                batch_features = feature_names[batch * batch_size : (batch + 1) * batch_size]
+                if not batch_features:
+                    break
+
+                plt.figure(figsize=(16, 8))
+
+                for i, feature in enumerate(batch_features, 1):
+                    before_df = pd.concat(
+                        [before_normalization[cls][[feature]].assign(Class=cls) for cls in self.data_dict.keys()]
+                    )
+                    after_df = pd.concat(
+                        [self.data_dict[cls][[feature]].assign(Class=cls) for cls in self.data_dict.keys()]
+                    )
+
+                    if before_df[feature].isna().all() or after_df[feature].isna().all():
+                        print(f"⚠️ Skipping {feature} due to all NaN values.")
+                        continue
+
+                    plt.subplot(2, len(batch_features), i)
+                    sns.boxplot(x="Class", y=feature, data=before_df)
+                    plt.xticks([], [])
+                    plt.title(f"Before: {feature}")
+
+                    plt.subplot(2, len(batch_features), i + len(batch_features))
+                    sns.boxplot(x="Class", y=feature, data=after_df)
+                    plt.xticks([], [])
+                    plt.title(f"After: {feature}")
+
+                plt.tight_layout()
+                plot_path = os.path.join(output_dir, f"Z_Normalization_Batch_{batch+1}.png")
+                plt.savefig(plot_path, dpi=300)
+                plt.close()
+
+            print(f" Saved boxplots in {output_dir}")
+        else:
+            print(f" Skipping Normalization plots...")
+
+        #  **Save Normalized Data Efficiently**
+        combined_df = pd.concat([df.assign(Class=cls) for cls, df in self.data_dict.items()], ignore_index=True)
+        combined_df.to_csv(os.path.join(output_dir, "Z_Normalized_Data.csv"), index=False)
+
+        #  **Memory Cleanup**
+        del numeric_features, global_means, global_stds, before_normalization, combined_df
         gc.collect()
+
+        print(" Z-score normalization completed successfully!")
 
     def statistical_analysis(self):
         """
         Perform statistical tests comparing each class to the control class based on user-specified parameters.
-        Includes support for **permutation tests** with batch processing and multi-core execution.
-        
+        Includes support for **blocked permutation tests** to account for day-to-day variance, with batch processing and multi-core execution.
+
         Returns:
         - pvalues_df (pd.DataFrame): DataFrame of p-values for each feature across classes.
         """
@@ -649,94 +787,109 @@ class SSA:
         num_cores = self.params.get("n_cores", -1)  # Use all available cores by default
         batch_size = self.params.get("batch_size", 10)  # Number of features per batch
 
-        # Define permutation test function
-        def permutation_test(func, x, y, num_perms):
-            """
-            Performs a permutation test using shuffled group labels.
-            Runs in parallel for efficiency.
+        # Read day information for blocked permutations
+        if "metadata_Day_of_run" not in self.data:
+            raise ValueError("The parameter 'metadata_Day_of_run' must be specified for blocked permutation tests.")
+        day_column = "metadata_Day_of_run"
 
-            Parameters:
-            - func: Statistical test function.
-            - x, y: Data samples.
-            - num_perms: Number of permutations.
-
-            Returns:
-            - p-value from the permutation test.
-            """
-            observed_stat = func(x, y)
-            combined = np.concatenate([x, y])
+       # Blocked permutation test function
+        def blocked_permutation_test(stat_func, x, y, day_labels, num_perms):
+            observed_stat = stat_func(x, y)
+            unique_days = np.intersect1d(np.unique(day_labels), np.unique(day_labels))
 
             def single_permutation():
-                np.random.shuffle(combined)
-                x_perm = combined[:len(x)]
-                y_perm = combined[len(x):]
-                return func(x_perm, y_perm) >= observed_stat
+                permuted_stats = []
+                for day in unique_days:
+                    day_indices_x = np.where(day_labels[:len(x)] == day)[0]
+                    day_indices_y = np.where(day_labels[len(x):] == day)[0]
 
-            # Run permutations in parallel
-            count = sum(Parallel(n_jobs=num_cores)(delayed(single_permutation)() for _ in range(num_perms)))
-            return count / num_perms
+                    if len(day_indices_x) == 0 or len(day_indices_y) == 0:
+                        continue  # Skip days without data in both groups
 
-        # Define function mapping
+                    combined = np.concatenate([x[day_indices_x], y[day_indices_y]])
+                    np.random.shuffle(combined)
+
+                    perm_x = combined[:len(day_indices_x)]
+                    perm_y = combined[len(day_indices_x):]
+                    permuted_stats.append(stat_func(perm_x, perm_y))
+
+                return np.sum(permuted_stats) if permuted_stats else 0
+
+            permuted_statistics = Parallel(n_jobs=num_cores)(
+                delayed(single_permutation)() for _ in range(num_perms)
+            )
+
+            p_value = (np.sum(np.abs(permuted_statistics) >= np.abs(observed_stat)) + 1) / (num_perms + 1)
+            return p_value
+
+        # Test function mapper
         def get_test_function(test_name):
-            """
-            Returns the appropriate test function (regular or permutation-based).
-            """
-            test_map = {
-                "t-test": (lambda x, y: ttest_ind(x, y, nan_policy='omit')[1], lambda x, y: permutation_test(lambda a, b: np.abs(np.mean(a) - np.mean(b)), x, y, num_permutations)),
-                "Independent t-test": (lambda x, y: ttest_ind(x, y, nan_policy='omit')[1], lambda x, y: permutation_test(lambda a, b: np.abs(np.mean(a) - np.mean(b)), x, y, num_permutations)),
-                "Paired t-test": (lambda x, y: ttest_rel(x, y, nan_policy='omit')[1], lambda x, y: permutation_test(lambda a, b: np.abs(np.mean(a - b)), x, y, num_permutations)),
-                "Welch t-test": (lambda x, y: ttest_ind(x, y, equal_var=False, nan_policy='omit')[1], lambda x, y: permutation_test(lambda a, b: np.abs(np.mean(a) - np.mean(b)), x, y, num_permutations)),
-                "Mann-Whitney": (lambda x, y: mannwhitneyu(x, y, alternative='two-sided')[1], lambda x, y: permutation_test(lambda a, b: np.abs(np.median(a) - np.median(b)), x, y, num_permutations)),
-                "Wilcoxon": (lambda x, y: wilcoxon(x, y)[1], lambda x, y: permutation_test(lambda a, b: np.abs(np.median(a) - np.median(b)), x, y, num_permutations)),
-                "Kruskal-Wallis": (lambda x, y: kruskal(x, y)[1], lambda x, y: permutation_test(lambda a, b: np.abs(np.median(a) - np.median(b)), x, y, num_permutations)),
-                "Friedman": (lambda x, y: friedmanchisquare(x, y)[1], lambda x, y: permutation_test(lambda a, b: np.abs(np.median(a) - np.median(b)), x, y, num_permutations)),
-                "Pearson": (lambda x, y: pearsonr(x, y)[1], lambda x, y: permutation_test(lambda a, b: np.abs(pearsonr(a, b)[0]), x, y, num_permutations)),
-                "Spearman": (lambda x, y: spearmanr(x, y)[1], lambda x, y: permutation_test(lambda a, b: np.abs(spearmanr(a, b)[0]), x, y, num_permutations)),
-                "Kendall": (lambda x, y: kendalltau(x, y)[1], lambda x, y: permutation_test(lambda a, b: np.abs(kendalltau(a, b)[0]), x, y, num_permutations)),
-                "Levene": (lambda x, y: levene(x, y)[1], lambda x, y: permutation_test(lambda a, b: np.abs(np.var(a) - np.var(b)), x, y, num_permutations)),
-                "Bartlett": (lambda x, y: bartlett(x, y)[1], lambda x, y: permutation_test(lambda a, b: np.abs(np.var(a) - np.var(b)), x, y, num_permutations)),
-                "Kolmogorov-Smirnov": (lambda x, y: ks_2samp(x, y)[1], lambda x, y: permutation_test(lambda a, b: np.abs(ks_2samp(a, b)[0]), x, y, num_permutations)),
-            }
-
-            return test_map.get(test_name, None)
+            return {
+                "t-test": (
+                    lambda x, y: ttest_ind(x, y, nan_policy='omit')[1],
+                    lambda x, y, days: blocked_permutation_test(lambda a, b: np.abs(np.mean(a) - np.mean(b)), x, y, days, num_permutations)
+                ),
+                "Mann-Whitney": (
+                    lambda x, y: mannwhitneyu(x, y, alternative='two-sided')[1],
+                    lambda x, y, days: blocked_permutation_test(lambda a, b: np.abs(np.median(a) - np.median(b)), x, y, days, num_permutations)
+                ),
+                "Kruskal-Wallis": (
+                    lambda x, y: kruskal(x, y)[1],
+                    lambda x, y, days: blocked_permutation_test(lambda a, b: np.abs(np.median(a) - np.median(b)), x, y, days, num_permutations)
+                ),
+                "Wilcoxon": (
+                    lambda x, y: wilcoxon(x, y)[1],
+                    lambda x, y, days: blocked_permutation_test(lambda a, b: np.abs(np.median(a) - np.median(b)), x, y, days, num_permutations)
+                ),
+            }.get(test_name, (None, None))
 
         test_func, perm_test_func = get_test_function(stat_test_type)
         if test_func is None:
-            raise ValueError(f"Statistical test '{stat_test_type}' is not supported.")
+            raise ValueError(f"Unsupported statistical test: '{stat_test_type}'")
 
-        # Batch processing of statistical tests
-        feature_batches = [self.feature_columns[i:i+batch_size] for i in range(0, len(self.feature_columns), batch_size)]
+        feature_batches = [self.feature_columns[i:i + batch_size] for i in range(0, len(self.feature_columns), batch_size)]
 
         for cls, df in tqdm(self.data_dict.items(), desc="Statistical Tests"):
             if cls == self.control_class:
                 continue
 
             class_features = df[self.feature_columns]
+            day_labels = df[day_column].values if use_permutation else None
             pvalues[cls] = []
 
             for batch in feature_batches:
-                pvalues[cls].extend(
-                    Parallel(n_jobs=num_cores)(
-                        delayed(perm_test_func if use_permutation else test_func)(control_features[f], class_features[f]) for f in batch
+                if use_permutation:
+                    batch_results = Parallel(n_jobs=num_cores)(
+                        delayed(perm_test_func)(
+                            control_features[feature].values,
+                            class_features[feature].values,
+                            np.concatenate([
+                                self.data_dict[self.control_class][day_column].values,
+                                df[day_column].values
+                            ])
+                        ) for feature in batch
                     )
-                )
+                else:
+                    batch_results = Parallel(n_jobs=num_cores)(
+                        delayed(test_func)(control_features[feature].values, class_features[feature].values)
+                        for feature in batch
+                    )
+
+                pvalues[cls].extend(batch_results)
 
         pvalues_df = pd.DataFrame(pvalues, index=self.feature_columns).T
 
-        # Apply multiple testing correction
-        correction_method = 'fdr_bh' if mt_correction == "fdr" else mt_correction
+        # Multiple testing correction
+        correction_method = 'fdr_bh' if mt_correction.lower() == "fdr" else mt_correction.lower()
         for feature in pvalues_df.columns:
-            valid_pvals = pvalues_df[feature].dropna()
-            _, corrected_pvals, _, _ = multipletests(valid_pvals, alpha=0.05, method=correction_method)
-            pvalues_df.loc[valid_pvals.index, feature] = corrected_pvals
+            valid_pvals = pvalues_df[feature].fillna(1.0)
+            _, corrected, _, _ = multipletests(valid_pvals, alpha=0.05, method=correction_method)
+            pvalues_df.loc[:, feature] = corrected
 
-        # Save the results
         pvalues_df.to_csv(output_file)
-        print(f"Statistical analysis results saved to {output_file}")
+        print(f" Statistical analysis results saved at: {output_file}")
 
-        # Store the results in self for later use
         self.pvalues_df = pvalues_df.T
-
         return pvalues_df
 
 
@@ -770,12 +923,12 @@ class SSA:
             self.output_directory = os.path.join(self.ssa.output_directory, "Isolation_Forest")
             os.makedirs(self.output_directory, exist_ok=True)
             self.params = self.ssa.params
-            self.n_iterations = self.params.get("n_iterations", 20)
-            self.contamination = self.params.get("contamination", 0.15)
-            self.consensus_percentage = self.params.get("consensus_percentage", 85)
+            self.n_iterations = self.params.get("n_iterations", 100)
+            self.contamination = self.params.get("contamination", 0.2)
+            self.consensus_percentage = self.params.get("consensus_percentage", 80)
             self.bootstrap_set_size = self.params.get("bootstrap_set_size", 200)
             self.num_workers = self.params.get("n_cores", mp.cpu_count())
-            self.censure = self.params.get("censure_level", 0.30)
+            self.censure = self.params.get("censure_level", 0.10)
 
              # Initialize data structures
             self.sample_anomaly_percentages = {}  # Ensure it always exists
@@ -786,42 +939,149 @@ class SSA:
             Execute Isolation Forest analysis with variance-based voting from full feature space.
             Now includes self-comparison of control class (control vs control) as a baseline.
             """
-            print("Starting per-sample Isolation Forest anomaly detection with control self-comparison...")
+            print("Starting parallel per-sample Isolation Forest anomaly detection...")
 
-            # Prepare Full Feature Data for Variance Analysis
-            self.full_combined_data = self._prepare_full_data()
+            #self.log_memory_usage("Before Loading Data")
+            
+            # Load class labels only (avoid full dataset copying)
+            full_combined_data_labels = pd.concat([
+                pd.DataFrame({"class_": [cls] * len(df)}) for cls, df in self.ssa.data_dict.items()
+            ], ignore_index=True)
 
-            # Prepare PCA-Reduced Data for Isolation Forest
-            combined_data, control_data = self._prepare_data()
+            #self.log_memory_usage("After Loading Data (Label Preparation)")
+
+            # Prepare PCA-Reduced Data (avoid copying full data)
+            combined_data, _ = self._prepare_data()
             pca_combined_data = self._apply_pca(combined_data)
+            
+            #self.log_memory_usage("After PCA Transformation")
 
-            # Include control class in target list for self-comparison
             target_classes = list(pca_combined_data["class_"].unique())
             if self.ssa.control_class not in target_classes:
                 target_classes.append(self.ssa.control_class)
 
-            class_anomaly_votes = {cls: [] for cls in target_classes}
+            # Use multiprocessing.Manager to create a shared queue
+            with mp.Manager() as manager:
+                result_queue = manager.Queue()
 
-            # Initialize anomaly percentages storage (INCLUDING CONTROL CLASS)
-            self.sample_anomaly_percentages = {
-                cls: [] for cls in pca_combined_data["class_"].unique()}
+                # Start a separate process to write results to CSV
+                writer_process = mp.Process(target=self._write_results_to_csv, args=(result_queue,))
+                writer_process.start()
 
+                #self.log_memory_usage("Before Multiprocessing Pool")
 
-            # Compute Control Baseline
-            self._compute_control_baseline()
-
-            for target_class in tqdm(target_classes, desc="Performing Isolation Forest Analysis"):
-                for iteration in range(self.n_iterations):
+                # Parallel Processing using a process pool
+                with mp.Pool(processes=self.num_workers) as pool:
+                    results = [
+                        pool.apply_async(
+                            self._process_target_class, 
+                            args=(index + 1, len(target_classes), target_class, 
+                                full_combined_data_labels, pca_combined_data, result_queue)
+                        ) 
+                        for index, target_class in enumerate(tqdm(target_classes, desc="Processing Classes"))
+                    ]
                     
-                    # Bootstrap from Full Data for Variance Analysis
-                    full_control_bootstrap, full_target_bootstrap = self._bootstrap_full_data(target_class)
+                    pool.close()
+                    pool.join()  # Ensures all processes are completed
 
-                    # Compute Variance Metrics (from Full Feature Data)
+                #self.log_memory_usage("After Multiprocessing Pool (Processing Done)")
+
+                # Signal writer process to stop
+                result_queue.put(None)
+                writer_process.join()
+
+            #self.log_memory_usage("Before Collecting Results")
+
+            # Collect Results
+            final_scores = {}
+            class_anomaly_votes = {}
+            anomaly_scores_list = []
+
+            for result in results:
+                output = result.get()
+                if output:
+                    target_class, final_vote_percentages, votes, scores = output
+                    class_anomaly_votes[target_class] = votes
+                    anomaly_scores_list.extend(scores)
+
+            self.ssa.anomaly_scores_df = pd.DataFrame(anomaly_scores_list)
+
+            # Compute Final Class-Level Anomaly Scores
+            for cls, votes in class_anomaly_votes.items():
+                if len(votes) > 2:
+                    sorted_votes = sorted(votes)
+                    lower_cutoff = max(1, int(len(sorted_votes) * self.censure))
+                    upper_cutoff = max(1, int(len(sorted_votes) * (1 - self.censure)))
+                    trimmed_votes = sorted_votes[lower_cutoff:upper_cutoff]
+                else:
+                    trimmed_votes = votes
+
+                final_scores[cls] = np.mean(trimmed_votes) if trimmed_votes else 0
+
+            self.ssa.anomalies = [cls for cls, score in final_scores.items() if score >= self.consensus_percentage]
+
+            # Initialize empty dictionary before collecting results
+            for result in results:
+                output = result.get()
+                if output:
+                    target_class, final_vote_percentages, votes, scores = output
+                    class_anomaly_votes[target_class] = votes
+                    anomaly_scores_list.extend(scores)
+
+                    self.sample_anomaly_percentages[target_class] = final_vote_percentages
+
+            # Convert results to DataFrame
+            self.ssa.anomaly_scores_df = pd.DataFrame(anomaly_scores_list)
+
+            # Plot results
+            if len(self.ssa.data_dict) < 100:
+                self._plot_anomaly_votes()
+                self._plot_anomaly_votes_interactive()
+            else:
+                self._plot_anomaly_votes_interactive()
+
+            print("Parallel Isolation Forest analysis completed.")
+
+
+        def _process_target_class(self, index, total_classes, target_class, full_combined_data_labels, pca_combined_data, result_queue):
+            """
+            Process a single target class against control using Isolation Forest in parallel.
+            Ensures that bootstrapping happens inside iterations for variability.
+            """
+            try:
+                print(f"Processing class {index}/{total_classes}: {target_class}")
+
+                # Compute control baseline once per class
+                self._compute_control_baseline()
+
+                # Extract only necessary control/target samples (avoid full dataset copies)
+                control_samples = self.ssa.data_dict[self.ssa.control_class][self.ssa.feature_columns]
+                target_samples = self.ssa.data_dict.get(target_class, pd.DataFrame())[self.ssa.feature_columns]
+
+                if control_samples.empty or target_samples.empty:
+                    print(f"⚠️ Skipping {target_class}: No valid control or target samples.")
+                    return None
+
+                class_anomaly_votes = []
+                anomaly_scores_list = []
+                final_vote_percentages = []
+
+                for iteration in range(self.n_iterations):
+                    self.log_memory_usage(f"Iteration {iteration} Start - {target_class}")
+
+                    # Bootstrap fresh data each iteration to ensure variability
+                    full_control_bootstrap, full_target_bootstrap = self._bootstrap_full_data(control_samples, target_samples)
+                    control_bootstrap, target_bootstrap = self._bootstrap_sample(pca_combined_data, target_class)
+
+                    self.log_memory_usage(f"After Bootstrapping Iteration {iteration} - {target_class}")
+
+                    # Compute Variance Metrics
                     full_combined_features = pd.concat([full_control_bootstrap, full_target_bootstrap])
                     top3_variance, variance_vote = self._compute_variance_metrics(full_combined_features)
 
-                    # Bootstrap from PCA Data for IFA
-                    control_bootstrap, target_bootstrap = self._bootstrap_sample(pca_combined_data, target_class)
+                    self.log_memory_usage(f"After Variance Computation Iteration {iteration} - {target_class}")
+
+                    # Train Isolation Forest on bootstrapped control samples
                     model = self._fit_isolation_forest(control_bootstrap)
 
                     # Predict anomaly percentages from PCA-Reduced Data
@@ -831,85 +1091,61 @@ class SSA:
                     # Compute PCA Vote
                     pca_vote = 1 if anomaly_percentage >= self.consensus_percentage else 0
 
-                    # Weighted Final Vote (35% Variance, 65% PCA)
-                    final_vote_percentage = 0.65 * anomaly_percentage + 0.35 * variance_vote * 100
+                    # Weighted Final Vote (90% PCA, 10% Variance)
+                    final_vote_percentage = 0.9 * anomaly_percentage + 0.1 * variance_vote * 100
                     final_vote = 1 if final_vote_percentage >= self.consensus_percentage else 0
 
-                    # Store Anomaly Percentage for Plotting
-                    self.sample_anomaly_percentages[target_class].append(final_vote_percentage)
+                    # Store results
+                    final_vote_percentages.append(final_vote_percentage)
+                    class_anomaly_votes.append(final_vote)
 
-                    
-                    class_anomaly_votes[target_class].append(final_vote)
+                    # Send data to result queue
+                    result_queue.put((target_class, iteration, anomaly_percentage, pca_vote, top3_variance, variance_vote, final_vote))
 
-                    # Save Iteration Metrics for Control Self-Comparison
-                    self._save_ballot_report(
-                        target_class, iteration, anomaly_percentage, 
-                        pca_vote, top3_variance, 
-                        variance_vote, final_vote
-                    )
+                    self.log_memory_usage(f"After Model Prediction Iteration {iteration} - {target_class}")
+                    anomaly_scores_list.append({
+                        "class_": target_class,
+                        "iteration": iteration + 1,
+                        "anomaly_vote_percentage": final_vote_percentage
+                    })
 
-                    # Store Metrics
-                    if target_class not in self.variance_metrics:
-                        self.variance_metrics[target_class] = {
-                            "top3_variance": []
-                        }
-                    self.variance_metrics[target_class]["top3_variance"].append(top3_variance)
+                    # Explicit memory cleanup
+                    del full_control_bootstrap, full_target_bootstrap, control_bootstrap, target_bootstrap, model
+                    gc.collect()
 
-                    self._plot_iteration_pca(
-                        full_control_bootstrap,  # Use full feature space
-                        full_target_bootstrap,
-                        target_class,
-                        iteration,
-                        anomaly_predictions,
-                        anomaly_percentage
-                    )
+                    self.log_memory_usage(f"After Memory Cleanup Iteration {iteration} - {target_class}")
 
-                    # Create DataFrame from collected iteration votes
-                    anomaly_scores_list = []
-                    for target_class, votes in self.sample_anomaly_percentages.items():
-                        for iteration, vote in enumerate(votes, start=1):
-                            anomaly_scores_list.append({
-                                "class_": target_class,
-                                "iteration": iteration,
-                                "anomaly_vote_percentage": vote
-                            })
+                self.log_memory_usage(f"End Processing {target_class}")
+                return target_class, final_vote_percentages, class_anomaly_votes, anomaly_scores_list
 
-            
-            # Save the full iteration-level vote data
-            self.ssa.anomaly_scores_df = pd.DataFrame(anomaly_scores_list)
+            except Exception as e:
+                print(f"Error processing {target_class}: {e}")
+                return None
 
 
-            # Compute final class anomaly scores using the lowest 30% of model outcomes
-            # Compute final class anomaly scores using double-sided censure
-            final_scores = {}
-            for cls, votes in class_anomaly_votes.items():
-                if len(votes) > 2:
-                    sorted_votes = sorted(votes)
-                    lower_cutoff = max(1, int(len(sorted_votes) * self.censure))
-                    upper_cutoff = max(1, int(len(sorted_votes) * (1 - self.censure)))
-                    
-                    # Trim from both ends
-                    trimmed_votes = sorted_votes[lower_cutoff:upper_cutoff]
-                else:
-                    # Fallback if too few votes
-                    trimmed_votes = votes
 
-                # Compute mean of trimmed votes
-                final_scores[cls] = np.mean(trimmed_votes) if trimmed_votes else 0
+        def _write_results_to_csv(self, result_queue):
+            """
+            Writes results from the multiprocessing queue to a CSV file.
+            This prevents memory buildup by streaming data instead of keeping everything in RAM.
+            """
+            ballot_report_path = os.path.join(self.output_directory, "IFA_Ballot_Report.csv")
 
+            with open(ballot_report_path, mode='w', newline='') as ballot_file:
+                ballot_writer = csv.writer(ballot_file)
+                ballot_writer.writerow([
+                    "Target_Class", "Iteration", "PCA_Anomaly_Percentage", 
+                    "PCA_Vote", "Target_Top3_Variance", "Variance_Vote", "Final_Vote"
+                ])
 
-            # Determine anomalies based on filtered scores
-            anomalies = [cls for cls, score in final_scores.items() if score >= self.consensus_percentage]
-
-            self.ssa.anomalies = anomalies
-
-            # Plot Anomaly Votes after completion
-            self._plot_anomaly_votes()
-
-            print("Variance-enhanced Isolation Forest analysis with self-comparison completed.")
-
-            return anomalies, pca_combined_data
-
+                while True:
+                    try:
+                        data = result_queue.get()
+                        if data is None:
+                            break  # Stop when None is received
+                        ballot_writer.writerow(data)
+                    except queue.Empty:
+                        continue  # Avoid blocking on empty queue
 
         def _prepare_data(self):
             combined_data = pd.concat([
@@ -939,50 +1175,56 @@ class SSA:
             return full_combined_data
 
         
-        def _bootstrap_full_data(self, target_class):
+        def _bootstrap_full_data(self, control_samples, target_samples):
             """
             Bootstrap samples from full feature data with balanced sample sizes for variance analysis.
             
-            Balances control and target samples by using the same number of samples 
-            (bootstrap if necessary).
-            
+            Parameters:
+            - control_samples (DataFrame): The control class feature data.
+            - target_samples (DataFrame): The target class feature data.
+
             Returns:
             - full_control_bootstrap (DataFrame): Balanced control samples.
             - full_target_bootstrap (DataFrame): Balanced target samples.
             """
-            full_control_samples = self.full_combined_data[
-                self.full_combined_data["class_"] == self.ssa.control_class
-            ]
-            full_target_samples = self.full_combined_data[
-                self.full_combined_data["class_"] == target_class
-            ]
-
             # Find the minimum sample size
-            min_samples = min(len(full_control_samples), len(full_target_samples))
+            min_samples = min(len(control_samples), len(target_samples))
+
+            if min_samples == 0:
+                print("⚠️ Warning: One of the classes has no samples! Returning empty dataframes.")
+                return pd.DataFrame(columns=control_samples.columns), pd.DataFrame(columns=target_samples.columns)
 
             # Bootstrap to balance the sample sizes
-            full_control_bootstrap = full_control_samples.sample(
-                n=min_samples, replace=len(full_control_samples) < min_samples
+            full_control_bootstrap = control_samples.sample(
+                n=min_samples, replace=len(control_samples) < min_samples
             )
-            full_target_bootstrap = full_target_samples.sample(
-                n=min_samples, replace=len(full_target_samples) < min_samples
+            full_target_bootstrap = target_samples.sample(
+                n=min_samples, replace=len(target_samples) < min_samples
             )
 
             return full_control_bootstrap, full_target_bootstrap
-
 
         def _compute_control_baseline(self):
             """
             Compute baseline variance metrics from the control class only.
             Stores values for reference during variance vote calculation.
             """
-            control_samples = self.full_combined_data[self.full_combined_data["class_"] == self.ssa.control_class].drop(columns=["class_"], errors="ignore")
+            # Load control samples directly instead of using `full_combined_data`
+            control_samples = pd.concat([
+                df[self.ssa.feature_columns]
+                for cls, df in self.ssa.data_dict.items()
+                if cls == self.ssa.control_class
+            ], ignore_index=True)
+
+            if control_samples.empty:
+                raise ValueError("No control samples found! Ensure control class exists in data.")
 
             pca = PCA()
             pca.fit(control_samples)
 
             self.control_top3_variance = sum(pca.explained_variance_ratio_[:3])
             self.control_components_for_70 = np.argmax(np.cumsum(pca.explained_variance_ratio_) >= 0.50) + 1
+
 
 
         def _compute_rqa_metrics(self, X):
@@ -1079,7 +1321,7 @@ class SSA:
             return control_bootstrap, target_bootstrap
 
         def _fit_isolation_forest(self, bootstrapped_data):
-            model = IsolationForest(n_estimators=500, contamination=self.contamination, random_state=42, max_samples=0.9)
+            model = IsolationForest(n_estimators=300, contamination=self.contamination, random_state=42, max_samples=0.7)
             model.fit(bootstrapped_data.drop(columns=["class_"]))
             return model
 
@@ -1158,54 +1400,74 @@ class SSA:
 
         def _plot_anomaly_votes(self):
             """
-            Generate boxplots for the distribution of anomaly percentages per class using data from self.sample_anomaly_percentages.
+            Generate boxplots for the distribution of anomaly percentages per class.
             - Classes are ordered by their mean anomaly score.
-            - Colors are assigned based on whether the mean exceeds the consensus threshold.
-            - Boxplot width is reduced to 20% of the default width.
+            - Box width is reduced to improve visualization.
             """
+
             plt.figure(figsize=(20, 10))
 
-            # Convert the anomaly percentages dictionary into a DataFrame with trimmed votes
+            # Convert self.sample_anomaly_percentages dictionary into a DataFrame
             plot_data = []
             for cls, percentages in self.sample_anomaly_percentages.items():
-                # Trim to the lowest 30% of values
-                trimmed_percentages = sorted(percentages)[:max(1, int(len(percentages) * self.censure))]
+                if not isinstance(percentages, list):
+                    print(f"⚠️ Warning: Class {cls} has invalid anomaly data format:", percentages)
+                    self.sample_anomaly_percentages[cls] = [percentages]  # Convert to list
+
+                if len(self.sample_anomaly_percentages[cls]) == 0:
+                    print(f"⚠️ Warning: Class {cls} has no valid anomaly percentages.")
+                    continue  # Skip empty classes
+
+                lower = int(len(self.sample_anomaly_percentages[cls]) * self.censure / 2)
+                upper = int(len(self.sample_anomaly_percentages[cls]) * (1 - self.censure / 2))
+                trimmed_percentages = sorted(self.sample_anomaly_percentages[cls])[lower:upper]
+
                 for value in trimmed_percentages:
                     plot_data.append({"class_": cls, "anomaly_vote_percentage": value})
 
+            # Debugging step: Check if plot_data is empty
+            if not plot_data:
+                raise ValueError(" Error: plot_data is empty! No valid anomaly percentages to plot.")
 
             plot_df = pd.DataFrame(plot_data)
 
-            # Generate the color mapping based on class mean scores
+            if "class_" not in plot_df.columns:
+                raise ValueError(" Error: 'class_' column is missing in plot_df!")
+
+            # Group and plot
             class_means = plot_df.groupby("class_")["anomaly_vote_percentage"].mean()
             sorted_classes = class_means.sort_values().index.tolist()
 
-            color_mapping = {}
-            for cls in sorted_classes:
-                mean_score = class_means[cls]
-                if cls == self.ssa.control_class:
-                    color_mapping[cls] = "gray"
-                elif mean_score >= self.consensus_percentage:
-                    color_mapping[cls] = "darkkhaki"
-                else:
-                    color_mapping[cls] = "steelblue"
+            # Compute the mean anomaly vote percentage per class
+            class_means = plot_df.groupby("class_")["anomaly_vote_percentage"].mean()
 
-            # Plot the boxplot using the anomaly percentage data
+            # Generate the color mapping
+            color_mapping = {}
+            for cls, mean_vote in class_means.items():
+                if cls == self.ssa.control_class:
+                    color_mapping[cls] = "gray"  # Control class is always gray
+                elif mean_vote >= self.consensus_percentage:
+                    color_mapping[cls] = "darkkhaki"  # Anomalies (above threshold)
+                else:
+                    color_mapping[cls] = "steelblue"  # Normal classes (below threshold)
+
+
+            # Boxplot visualization
             sns.boxplot(
                 x="class_", 
                 y="anomaly_vote_percentage", 
                 data=plot_df, 
                 order=sorted_classes, 
-                palette=color_mapping,  # Dictionary-based color assignment
-                width=0.2,  # 20% of original width
+                palette=color_mapping,  
+                width=0.2,  
                 hue="class_",
                 legend=False
             )
 
-            # Add a horizontal line for the consensus threshold
+            # Horizontal threshold line
             plt.axhline(y=self.consensus_percentage, color="red", linestyle="--", label="Consensus Threshold")
             plt.ylim(-10, 110)
-            plt.title("Class-Level Anomaly Vote Percentages (Model Outcomes)")
+            plt.title("Class-Level Anomaly Vote Percentages")
             plt.xlabel("Class")
             plt.ylabel("Anomaly Vote Percentage")
             plt.xticks(rotation=90)
@@ -1217,7 +1479,90 @@ class SSA:
             plt.savefig(plot_path, format="png", dpi=300)
             plt.close()
 
-            print(f"Saved IFA anomaly vote boxplot: {plot_path}")
+            print(f" Saved IFA anomaly vote boxplot: {plot_path}")
+
+
+        def _plot_anomaly_votes_interactive(self):
+            """
+            Generate an interactive scatter plot for anomaly vote percentages per class.
+            - Supports 5,000+ classes.
+            - Each class is represented as a dot (mean anomaly vote %).
+            - Vertical error bars show SEM (Standard Error of the Mean).
+            - Classes are ordered from highest to lowest anomaly percentage.
+            - Saves CSV file with sorted class anomaly percentages.
+            """
+
+            print("Generating interactive anomaly vote plot...")
+
+            # Convert self.sample_anomaly_percentages to a DataFrame
+            plot_data = []
+            for cls, percentages in self.sample_anomaly_percentages.items():
+                lower = int(len(percentages) * self.censure / 2)
+                upper = int(len(percentages) * (1 - self.censure / 2))
+                trimmed_percentages = sorted(percentages)[lower:upper]
+
+                if len(trimmed_percentages) > 1:
+                    mean_value = np.mean(trimmed_percentages)
+                    sem_value = np.std(trimmed_percentages) / np.sqrt(len(trimmed_percentages))  # Standard Error of Mean
+                else:
+                    mean_value = trimmed_percentages[0] if trimmed_percentages else 0
+                    sem_value = 0
+
+                plot_data.append({
+                    "class_": cls,
+                    "mean_anomaly_vote_percentage": mean_value,
+                    "sem": sem_value
+                })
+
+            # Convert to DataFrame
+            plot_df = pd.DataFrame(plot_data)
+
+            # Sort by anomaly vote percentage (High → Low)
+            plot_df = plot_df.sort_values(by="mean_anomaly_vote_percentage", ascending=False).reset_index(drop=True)
+
+            # Save CSV File
+            csv_path = os.path.join(self.output_directory, "IFA_Anomaly_Vote_Sorted.csv")
+            plot_df.to_csv(csv_path, index=False)
+            print(f"Saved sorted anomaly votes: {csv_path}")
+
+            plot_df = plot_df.sort_values(by="mean_anomaly_vote_percentage", ascending=True).reset_index(drop=True)
+
+            # Prepare Interactive Plot
+            fig = go.Figure()
+
+            fig.add_trace(go.Scatter(
+                x=plot_df["class_"],
+                y=plot_df["mean_anomaly_vote_percentage"],
+                mode='markers',
+                marker=dict(size=6, color='steelblue', opacity=0.8),
+                error_y=dict(type='data', array=plot_df["sem"], color='gray', thickness=1),
+                hoverinfo="x+y",
+                name="Anomaly Vote %"
+            ))
+
+            # Add Consensus Threshold Line
+            fig.add_trace(go.Scatter(
+                x=plot_df["class_"],
+                y=[self.consensus_percentage] * len(plot_df),
+                mode='lines',
+                line=dict(color='red', dash='dash', width=2),
+                name="Consensus Threshold"
+            ))
+
+            # Layout Customization
+            fig.update_layout(
+                title="Interactive Class-Level Anomaly Vote Percentages",
+                xaxis=dict(title="Class", tickangle=90, showticklabels=False),
+                yaxis=dict(title="Anomaly Vote Percentage", range=[-10, 110]),
+                template="plotly_white",
+                margin=dict(l=50, r=20, t=50, b=100),
+                hovermode="closest"
+            )
+
+            # Save Interactive HTML Plot
+            plot_path = os.path.join(self.output_directory, "IFA_Anomaly_Votes_Interactive.html")
+            fig.write_html(plot_path)
+            print(f"Saved interactive anomaly vote plot: {plot_path}")
 
         def _compute_variance_metrics(self, combined_features):
             """
@@ -1260,6 +1605,12 @@ class SSA:
                 pca_vote, round(target_top3_variance, 4), 
                 round(variance_vote, 4), final_vote
             ])
+        
+        def log_memory_usage(self,label):
+            """ Logs the current RAM usage with a label. """
+            process = psutil.Process(os.getpid())
+            mem_usage = process.memory_info().rss / (1024 * 1024)  # Convert to MB
+            print(f"[RAM] {label}: {mem_usage:.2f} MB")
 
 ########################    
     
@@ -1316,7 +1667,7 @@ class SSA:
             'status': ['Match' if cls in hits else 'Only Anomaly' for cls in anomalies]
         })
 
-        # 🧬 Combine DataFrames
+        # Combine DataFrames
         hits_and_anomalies = hits_df[hits_df['class'].isin(anomalies)]
         only_anomalies = anomalies_df[~anomalies_df['class'].isin(hits)]
         only_hits = hits_df[~hits_df['class'].isin(anomalies)]
@@ -1336,268 +1687,562 @@ class SSA:
 
     def plot_pca(self):
         """
-        Generates interactive 3D PCA plots:
-        - Control vs All Classes
-        - Custom class list PCA plots from parameters
-
-        Features:
-        - Distinguishes up to 12,000 classes (colors, markers, edge styles, transparencies, fill patterns)
-        - Randomized class-style assignment
-        - Interactive 3D plots with hover labels
-        - Control points 3x larger for visibility
-        - Variance explained shown on axes
-        - Legends only if classes ≤30
-        - Plots saved to 'Analysis/PCA'
+        Generates interactive 3D PCA plots with toggle for Class vs Class+Date.
+        - Preserves clipboard copying.
+        - Shows clean class legend initially.
+        - When toggled, shows detailed Class+Date legend.
         """
         print("Generating interactive PCA plots...")
 
-        # Output directory
+        shapes = ['circle', 'circle-open', 'cross', 'diamond','diamond-open', 'square', 'square-open', 'x']
+
+
+        base_colors = (
+            px.colors.qualitative.Set1 +
+            px.colors.qualitative.Pastel +
+            px.colors.qualitative.Dark24 +
+            px.colors.qualitative.Light24
+        )
+
+
         pca_output_dir = os.path.join(self.output_directory, "PCA")
         os.makedirs(pca_output_dir, exist_ok=True)
 
-        # Extract features and classes
+        # Prepare combined data from all classes
         data = pd.concat([
-            df[self.feature_columns].assign(class_=cls)
+            df[self.feature_columns].assign(class_=cls, metadata_Day_of_run=df["metadata_Day_of_run"])
             for cls, df in self.data_dict.items()
         ], ignore_index=True)
+
         features = data[self.feature_columns].fillna(0)
         classes = data["class_"]
+        run_dates = data["metadata_Day_of_run"].astype(str)
         core_well_ids = self.data["core_well_id"]
-        
-        # PCA computation
+
+        # Compute PCA
         pca = PCA(n_components=3)
         pca_result = pca.fit_transform(features)
         explained_variance = pca.explained_variance_ratio_ * 100
 
-        # Style definitions
-        colors = px.colors.qualitative.Alphabet  # 26 distinct colors
-        markers = ['circle', 'square', 'diamond', 'cross', 'x', 'triangle-up', 'triangle-down', 'star']
-        edge_styles = ['solid', 'dot', 'dash', 'longdash']
-        transparencies = [0.4, 0.55, 0.7, 0.85, 1.0]
-        fill_patterns = ['/', '\\', '|', '-', '+']
+        # Prepare DataFrame for plotting
+        plot_df = pd.DataFrame(pca_result, columns=["PC1", "PC2", "PC3"])
+        plot_df["Class"] = classes
+        plot_df["Run Date"] = run_dates
+        plot_df["CoreWellID"] = core_well_ids
+        plot_df["Class+Date"] = plot_df["Class"] + "_" + plot_df["Run Date"]
 
-        # Generate all possible combinations
-        style_combinations = list(itertools.product(colors, markers, edge_styles, transparencies, fill_patterns))
-        random.shuffle(style_combinations)  # Randomize assignment
-
+        # Unique values
         unique_classes = sorted(classes.unique())
-        if len(unique_classes) > len(style_combinations):
-            raise ValueError(f"Too many classes ({len(unique_classes)}). Max supported: {len(style_combinations)}.")
+        unique_class_dates = sorted(plot_df["Class+Date"].unique())
 
-        # Map classes to random styles
-        class_style_map = {cls: style_combinations[i] for i, cls in enumerate(unique_classes)}
+        # Build (color, shape) combinations, exhausting all colors for each shape before moving to next shape
+        color_shape_combinations = []
+        for shape in shapes:
+            for color in base_colors:
+                color_shape_combinations.append((color, shape))
 
-        nightmode=self.params.get("PCA_nightmode", False)
+        # Assign color and shape to each class
+        class_styles = {}
+        for i, cls in enumerate(unique_classes):
+            if cls == self.control_class:
+                class_styles[cls] = {'color': 'black', 'shape': 'circle'}  # Control always black circle
+            else:
+                color, shape = color_shape_combinations[i % len(color_shape_combinations)]
+                class_styles[cls] = {'color': color, 'shape': shape}
 
-        def create_pca_plot(pca_data, class_labels, title, filename, nightmode,core_well_id):
-            plot_df = pd.DataFrame(pca_data, columns=["PC1", "PC2", "PC3"])
-            plot_df["Class"] = class_labels
-            plot_df["CoreWellID"] = core_well_id
+        class_date_colors = {cd: base_colors[i % len(base_colors)] for i, cd in enumerate(unique_class_dates)}
 
-            # Assign styles to each class
-            plot_df["Color"] = plot_df["Class"].map(lambda cls: class_style_map[cls][0])
-            plot_df["Symbol"] = plot_df["Class"].map(lambda cls: class_style_map[cls][1])
-            plot_df["Alpha"] = plot_df["Class"].map(lambda cls: class_style_map[cls][3])
-            plot_df["Size"] = plot_df["Class"].map(lambda cls: 15 if cls == self.control_class else 5)
+        # Create initial plot with class-based traces
+        fig = go.Figure()
 
-            # Create the interactive 3D scatter plot with core_well_id in custom_data
-            fig = px.scatter_3d(
-                plot_df,
-                x="PC1", y="PC2", z="PC3",
-                color="Class",
-                symbol="Class",
-                size="Size",
-                opacity=0.8,
-                hover_data={"CoreWellID": True, "Class": True},
-                custom_data=["CoreWellID"],
-                title=title
-            )
+        traces_class = []
+        traces_class_date = []
 
-            # Layout adjustments for night mode and white background
-            axis_settings = dict(
-                backgroundcolor="black" if nightmode else "white",
-                gridcolor="gray" if nightmode else "lightgray",
-                zerolinecolor="white" if nightmode else "black",
-                color="white" if nightmode else "black",
-            )
+        for cls in unique_classes:
+            df_class = plot_df[plot_df["Class"] == cls]
+            traces_class.append(go.Scatter3d(
+                x=df_class["PC1"], y=df_class["PC2"], z=df_class["PC3"],
+                mode='markers',
+                marker=dict(size=8 if cls == self.control_class else 7, 
+                            color='black' if cls == self.control_class else class_styles[cls]['color'],
+                            symbol=class_styles[cls]['shape']),
+                name=cls,
+                customdata=df_class[["CoreWellID"]],
+                hovertemplate="<b>CoreWellID:</b> %{customdata[0]}<extra></extra>",
+                visible=True
+            ))
 
-            fig.update_layout(
-                scene=dict(
-                    xaxis=dict(title=f"PC1 ({explained_variance[0]:.2f}% variance)", **axis_settings),
-                    yaxis=dict(title=f"PC2 ({explained_variance[1]:.2f}% variance)", **axis_settings),
-                    zaxis=dict(title=f"PC3 ({explained_variance[2]:.2f}% variance)", **axis_settings),
-                    bgcolor="black" if nightmode else "white"
-                ),
-                legend=dict(
-                    visible=len(plot_df["Class"].unique()) <= 30,
-                    font=dict(color="white" if nightmode else "black")
-                ),
-                paper_bgcolor="black" if nightmode else "white",
-                plot_bgcolor="black" if nightmode else "white",
-            )
+        for class_date in unique_class_dates:
+            df_class_date = plot_df[plot_df["Class+Date"] == class_date]
+            traces_class_date.append(go.Scatter3d(
+                x=df_class_date["PC1"], y=df_class_date["PC2"], z=df_class_date["PC3"],
+                mode='markers',
+                marker=dict(size=5, color=class_date_colors[class_date]),
+                name=class_date,
+                customdata=df_class_date[["CoreWellID"]],
+                hovertemplate="<b>CoreWellID:</b> %{customdata[0]}<extra></extra>",
+                visible=False
+            ))
 
-            # JavaScript to copy core_well_id 
-            clipboard_js = """
-            document.addEventListener('DOMContentLoaded', function() {
-                var plot = document.getElementsByClassName('plotly-graph-div')[0];
-                if (plot) {
-                    plot.on('plotly_click', function(data) {
-                        if (data && data.points && data.points.length > 0) {
-                            var coreWellID = data.points[0].customdata[0];  // Access core_well_id
-                            navigator.clipboard.writeText(coreWellID).then(function() {
-                                alert('Copied to clipboard: ' + coreWellID);  // Confirmation alert
-                            }).catch(function(err) {
-                                console.error('Clipboard copy failed: ', err);
-                            });
-                        }
-                    });
-                }
-            });
-            """
+        for trace in traces_class + traces_class_date:
+            fig.add_trace(trace)
 
-            # Add the JS code into the HTML file
-            html_content = pio.to_html(fig, full_html=True, include_plotlyjs='cdn')
-            html_with_js = html_content.replace('</body>', f'<script>{clipboard_js}</script></body>')
-
-            # Save the HTML file with the JavaScript for clipboard copying
-            output_path = os.path.join(pca_output_dir, filename)
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(html_with_js)
-
-            print(f"Saved interactive PCA plot: {output_path}")
-
-        # Plot: Control vs All Classes
-        create_pca_plot(
-            pca_data=pca_result,
-            class_labels=classes,
-            title="PCA: Control vs All Classes",
-            filename="PCA_Control_vs_All.html",
-            nightmode=nightmode,
-            core_well_id=core_well_ids
+        # Add toggle button
+        fig.update_layout(
+            updatemenus=[
+                dict(
+                    type="buttons",
+                    direction="left",
+                    buttons=[
+                        dict(label="Color by Class", method="update",
+                            args=[{"visible": [True] * len(traces_class) + [False] * len(traces_class_date)}]),
+                        dict(label="Color by Class+Date", method="update",
+                            args=[{"visible": [False] * len(traces_class) + [True] * len(traces_class_date)}]),
+                    ],
+                    showactive=True
+                )
+            ]
         )
 
-        # Ensure consistent indexing before PCA
-        data = data.reset_index(drop=True)
-        pca_result = pca.fit_transform(data[self.feature_columns])
+        # 3D plot axis & layout
+        fig.update_layout(
+            scene=dict(
+                xaxis_title=f"PC1 ({explained_variance[0]:.2f}% variance)",
+                yaxis_title=f"PC2 ({explained_variance[1]:.2f}% variance)",
+                zaxis_title=f"PC3 ({explained_variance[2]:.2f}% variance)"
+            )
+        )
 
-        # Custom class list plots (from params)
+        # Clipboard copying functionality
+        clipboard_js = """
+        document.addEventListener('DOMContentLoaded', function() {
+            var plot = document.getElementsByClassName('plotly-graph-div')[0];
+            if (plot) {
+                plot.on('plotly_click', function(data) {
+                    if (data && data.points && data.points.length > 0) {
+                        var coreWellID = data.points[0].customdata[0];
+                        navigator.clipboard.writeText(coreWellID).then(function() {
+                            var message = document.createElement('div');
+                            message.innerText = 'Copied to clipboard: ' + coreWellID;
+                            message.style.position = 'fixed';
+                            message.style.top = '10px';
+                            message.style.left = '50%';
+                            message.style.transform = 'translateX(-50%)';
+                            message.style.backgroundColor = 'black';
+                            message.style.color = 'white';
+                            message.style.padding = '10px';
+                            message.style.borderRadius = '5px';
+                            document.body.appendChild(message);
+                            setTimeout(() => { message.remove(); }, 2000);
+                        }).catch(function(err) {
+                            console.error('Clipboard copy failed: ', err);
+                        });
+                    }
+                });
+            }
+        });
+        """
+
+        # Save plot with clipboard support
+        output_path = os.path.join(pca_output_dir, "PCA_Control_vs_All.html")
+        html_content = pio.to_html(fig, full_html=True, include_plotlyjs='cdn')
+        html_with_js = html_content.replace('</body>', f'<script>{clipboard_js}</script></body>')
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(html_with_js)
+
+        print(f"Saved interactive PCA plot: {output_path}")
+
+        # Load custom groups from params
         additional_class_lists = self.params.get("pca_custom_groups", [])
 
         for idx, class_list in enumerate(additional_class_lists):
             try:
-                # Ensure both data and self.data have the same indices
-                data = data.reset_index(drop=True)
-                self.data = self.data.reset_index(drop=True)
+                # Filter for only the desired classes
+                filtered_df = plot_df[plot_df["Class"].isin(class_list)]
 
-                # Filter based on class list
-                filtered_indices = data["class_"].isin(class_list)
+                if filtered_df.empty:
+                    print(f"⚠️ Custom set {idx+1} has no matching data and will be skipped.")
+                    continue
 
-                # Extract PCA and labels
-                pca_filtered = pca_result[filtered_indices.values]
-                class_labels_filtered = data.loc[filtered_indices, "class_"].values
+                unique_filtered_classes = sorted(filtered_df["Class"].unique())
+                unique_filtered_class_dates = sorted(filtered_df["Class+Date"].unique())
 
-                # Extract core_well_id from self.data using aligned indices
-                core_well_ids_filtered = self.data.loc[data.index[filtered_indices], "core_well_id"].values
+                # Rebuild traces for this custom set
+                fig = go.Figure()
 
-                # Validate lengths
-                if not (len(pca_filtered) == len(class_labels_filtered) == len(core_well_ids_filtered)):
-                    raise ValueError(
-                        f"Length mismatch: PCA data ({len(pca_filtered)}), Classes ({len(class_labels_filtered)}), CoreWellIDs ({len(core_well_ids_filtered)})"
-                    )
+                traces_class = []
+                traces_class_date = []
 
-                # Generate PCA plot
-                create_pca_plot(
-                    pca_data=pca_filtered,
-                    class_labels=class_labels_filtered,
-                    title=f"PCA_Control_vs_CustomSet_{idx+1}",
-                    filename=f"PCA_Control_vs_CustomSet_{idx+1}.html",
-                    nightmode=nightmode,
-                    core_well_id=core_well_ids_filtered
+                for cls in unique_filtered_classes:
+                    df_class = filtered_df[filtered_df["Class"] == cls]
+                    traces_class.append(go.Scatter3d(
+                        x=df_class["PC1"], y=df_class["PC2"], z=df_class["PC3"],
+                        mode='markers',
+                        marker=dict(
+                                    size=14 if cls == self.control_class else 8,
+                                    color=class_styles.get(cls, {"color": "gray"})['color'],
+                                    symbol=class_styles.get(cls, {"shape": "circle"})['shape']             
+                                    ),
+                        name=cls,
+                        customdata=df_class[["CoreWellID"]],
+                        hovertemplate="<b>CoreWellID:</b> %{customdata[0]}<extra></extra>",
+                        visible=True
+                    ))
+
+                for class_date in unique_filtered_class_dates:
+                    df_class_date = filtered_df[filtered_df["Class+Date"] == class_date]
+                    traces_class_date.append(go.Scatter3d(
+                        x=df_class_date["PC1"], y=df_class_date["PC2"], z=df_class_date["PC3"],
+                        mode='markers',
+                        marker=dict(size=5, color=class_date_colors.get(class_date, "gray")),
+                        name=class_date,
+                        customdata=df_class_date[["CoreWellID"]],
+                        hovertemplate="<b>CoreWellID:</b> %{customdata[0]}<extra></extra>",
+                        visible=False
+                    ))
+
+                for trace in traces_class + traces_class_date:
+                    fig.add_trace(trace)
+
+                # Add toggle button
+                fig.update_layout(
+                    updatemenus=[
+                        dict(
+                            type="buttons",
+                            direction="left",
+                            buttons=[
+                                dict(
+                                    label="Color by Class",
+                                    method="update",
+                                    args=[{"visible": [True] * len(traces_class) + [False] * len(traces_class_date)}]
+                                ),
+                                dict(
+                                    label="Color by Class+Date",
+                                    method="update",
+                                    args=[{"visible": [False] * len(traces_class) + [True] * len(traces_class_date)}]
+                                ),
+                                dict(
+                                    label="Hide All",
+                                    method="update",
+                                    args=[{"visible": [False] * (len(traces_class) + len(traces_class_date))}]
+                                )
+                            ],
+                            showactive=True
+                        )
+                    ]
                 )
 
-            except Exception as e:
-                print(f"Error during PCA plot generation: {e}")
 
-        print("PCA plotting completed.")
+                # 3D plot axis
+                fig.update_layout(
+                    scene=dict(
+                        xaxis_title=f"PC1 ({explained_variance[0]:.2f}% variance)",
+                        yaxis_title=f"PC2 ({explained_variance[1]:.2f}% variance)",
+                        zaxis_title=f"PC3 ({explained_variance[2]:.2f}% variance)"
+                    )
+                )
+
+                # Clipboard support for custom set
+                clipboard_js = """
+                document.addEventListener('DOMContentLoaded', function() {
+                    var plot = document.getElementsByClassName('plotly-graph-div')[0];
+                    if (event.key === "h" || event.key === "H") {
+                        Plotly.restyle(document.getElementsByClassName('plotly-graph-div')[0], "visible", [false]);
+                        console.log("All classes hidden (Hotkey: H)");
+                    }
+                    if (plot) {
+                        plot.on('plotly_click', function(data) {
+                            if (data && data.points && data.points.length > 0) {
+                                var coreWellID = data.points[0].customdata[0];
+                                navigator.clipboard.writeText(coreWellID).then(function() {
+                                    var message = document.createElement('div');
+                                    message.innerText = 'Copied to clipboard: ' + coreWellID;
+                                    message.style.position = 'fixed';
+                                    message.style.top = '10px';
+                                    message.style.left = '50%';
+                                    message.style.transform = 'translateX(-50%)';
+                                    message.style.backgroundColor = 'black';
+                                    message.style.color = 'white';
+                                    message.style.padding = '10px';
+                                    message.style.borderRadius = '5px';
+                                    document.body.appendChild(message);
+                                    setTimeout(() => { message.remove(); }, 2000);
+                                }).catch(function(err) {
+                                    console.error('Clipboard copy failed: ', err);
+                                });
+                            }
+                        });
+                    }
+                });
+                """
+
+                # Save custom set plot with embedded JS
+                output_path = os.path.join(pca_output_dir, f"PCA_CustomSet_{idx+1}.html")
+                html_content = pio.to_html(fig, full_html=True, include_plotlyjs='cdn')
+                html_with_js = html_content.replace('</body>', f'<script>{clipboard_js}</script></body>')
+
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(html_with_js)
+
+                print(f"Saved interactive PCA plot for Custom Set {idx+1}: {output_path}")
+
+            except Exception as e:
+                print(f"Error during PCA plot generation for Custom Set {idx+1}: {e}")
+
+    def plot_ellipse_pca(self):
+
+        output_dir = os.path.join(self.output_directory, "PCA")
+        os.makedirs(output_dir, exist_ok=True)
+
+        data = pd.concat([
+            df[self.feature_columns].assign(class_=cls, core_well_id=df['core_well_id'])
+            for cls, df in self.data_dict.items()
+        ], ignore_index=True)
+
+        features = data[self.feature_columns].fillna(0)
+        classes = data["class_"]
+        core_well_ids = data["core_well_id"]
+
+        pca = PCA(n_components=3)
+        pca_result = pca.fit_transform(features)
+        data["PC1"], data["PC2"], data["PC3"] = pca_result[:, 0], pca_result[:, 1], pca_result[:, 2]
+        explained_variance = pca.explained_variance_ratio_ * 100
+
+        confidence_levels = [0.15, 0.25, 0.35, 0.5, 0.65, 0.75, 0.85, 0.95]
+
+        class_colors = {
+            cls: 'black' if cls == self.control_class else px.colors.qualitative.Set1[i % len(px.colors.qualitative.Set1)]
+            for i, cls in enumerate(sorted(data['class_'].unique()))
+        }
+
+        def calculate_ellipse_and_density(df, pcx, pcy):
+            points = np.column_stack([df[pcx], df[pcy]])
+            mean = np.mean(points, axis=0)
+            cov = np.cov(points, rowvar=False)
+
+            kde = gaussian_kde(points.T)
+            grid_x, grid_y = np.meshgrid(
+                np.linspace(min(points[:, 0]), max(points[:, 0]), 100),
+                np.linspace(min(points[:, 1]), max(points[:, 1]), 100)
+            )
+            grid_positions = np.vstack([grid_x.ravel(), grid_y.ravel()])
+            densities = kde(grid_positions).reshape(grid_x.shape)
+
+            ellipses = {}
+            for level in confidence_levels:
+                chi2_val = chi2.ppf(level, 2)
+                eigenvalues, eigenvectors = np.linalg.eigh(cov)
+                width, height = 2 * np.sqrt(eigenvalues * chi2_val)
+                ellipse = np.column_stack([np.cos(np.linspace(0, 2*np.pi, 100)), np.sin(np.linspace(0, 2*np.pi, 100))])
+                ellipse = ellipse @ np.diag([width / 2, height / 2]) @ eigenvectors.T + mean
+                ellipses[level] = ellipse
+
+            return mean, ellipses, grid_x, grid_y, densities
+
+        def extract_contour_polygons(grid_x, grid_y, densities, levels):
+            fig, ax = plt.subplots()
+            contour = ax.contourf(grid_x, grid_y, densities, levels=levels, cmap="Blues", alpha=0.7)
+            plt.close(fig)
+
+            polygons = []
+            for collection in contour.collections:
+                for path in collection.get_paths():
+                    vertices = path.vertices
+                    if len(vertices) > 3:  # Avoid degenerate paths
+                        polygons.append(vertices)
+
+            return polygons
+
+        def create_pca_plot(pcx, pcy, filename):
+            fig = go.Figure()
+            density_traces, ellipse_traces = [], []
+            legend_shown = set()
+
+            for class_name, class_df in data.groupby("class_"):
+                mean, ellipses, grid_x, grid_y, densities = calculate_ellipse_and_density(class_df, pcx, pcy)
+                class_color = class_colors[class_name]
+
+                fig.add_trace(go.Scatter(
+                    x=[mean[0]], y=[mean[1]], mode='markers',
+                    marker=dict(size=8, color=class_color, line=dict(width=1, color='black')),
+                    name=class_name,
+                    legendgroup=class_name,
+                    showlegend=class_name not in legend_shown,
+                    customdata=[class_df.iloc[0]["core_well_id"]],
+                    hovertemplate=f"<b>Class:</b> {class_name}<br>{pcx}: {{x:.2f}}<br>{pcy}: {{y:.2f}}<br><extra></extra>"
+                ))
+                legend_shown.add(class_name)
+
+                for level, ellipse in ellipses.items():
+                    ellipse_traces.append(go.Scatter(
+                        x=ellipse[:, 0], y=ellipse[:, 1], mode='lines',
+                        line=dict(color=class_color, width=1),
+                        legendgroup=class_name,
+                        showlegend=False,
+                        hoverinfo='skip'
+                    ))
+                    fig.add_trace(ellipse_traces[-1])
+
+                levels = np.linspace(densities.min(), densities.max(), 6)[1:]  # 5 levels
+                polygons = extract_contour_polygons(grid_x, grid_y, densities, levels)
+
+                max_opacity = 0.6
+                min_opacity = 0.15
+                opacities = np.linspace(min_opacity, max_opacity, len(polygons))  # Darker inner, lighter outer
+
+                for idx, polygon in enumerate(polygons):
+                    density_traces.append(go.Scatter(
+                        x=polygon[:, 0],
+                        y=polygon[:, 1],
+                        fill='toself',
+                        fillcolor=class_color,
+                        opacity=opacities[idx],
+                        line=dict(width=0),
+                        legendgroup=class_name,
+                        showlegend=False,
+                        visible=False
+                    ))
+                    fig.add_trace(density_traces[-1])
+
+            fig.update_layout(
+                updatemenus=[dict(
+                    type='buttons',
+                    buttons=[
+                        dict(label="Show Ellipses Only", method="update", args=[{"visible": [
+                            t not in density_traces for t in fig.data
+                        ]}]),
+                        dict(label="Show Density Only", method="update", args=[{"visible": [
+                            t in density_traces or (t not in density_traces and t not in ellipse_traces) for t in fig.data
+                        ]}])
+                    ],
+                    direction='left',
+                    showactive=True,
+                    x=0.5, xanchor="center",
+                    y=1.15, yanchor="top"
+                )]
+            )
+
+            fig.update_layout(
+                xaxis_title=f"{pcx} ({explained_variance[{'PC1':0, 'PC2':1, 'PC3':2}[pcx]]:.2f}% variance)",
+                yaxis_title=f"{pcy} ({explained_variance[{'PC1':0, 'PC2':1, 'PC3':2}[pcy]]:.2f}% variance)",
+                title_text=f"PCA: {pcx} vs {pcy} with Multi-Level Ellipses and Layered KDE Densities",
+                legend=dict(title="Class", itemsizing="constant"),
+                width=1000, height=800,
+                plot_bgcolor='white', paper_bgcolor='white',
+                xaxis=dict(showgrid=False, zeroline=False),
+                yaxis=dict(showgrid=False, zeroline=False)
+            )
+
+            output_path = os.path.join(output_dir, filename)
+            with open(output_path, "w") as f:
+                f.write(pio.to_html(fig))
+
+            print(f" Saved: {output_path}")
+
+        create_pca_plot("PC1", "PC2", "Density_PCA_PC1_vs_PC2.html")
+        create_pca_plot("PC1", "PC3", "Density_PCA_PC1_vs_PC3.html")
+        create_pca_plot("PC2", "PC3", "Density_PCA_PC2_vs_PC3.html")
+
+        print(" All PCA plots saved successfully.")
 
     def plot_parallel_coordinates(self):
         """
         Generate parallel coordinates plots for the control class vs each target class.
-        Features are ordered based on the hierarchical clustering result.
-        Saves the plots in a Parallel_Coordinates folder inside the Analysis directory.
+
+        **Key Features:**
+        - **Target and Control are now both represented using median + IQR.**
+        - **No individual target lines—improves readability.**
+        - **All features included (no p-value or extreme value filtering).**
+        - **Condition-Specific Plots:** Features are grouped based on conditions.
+        - **Organized Outputs:** Plots are saved in condition-specific folders.
         """
-        # Ensure p-values and feature order are available
-        if not hasattr(self, 'pvalues_df'):
-            raise AttributeError("Statistical analysis (p-values) must be performed before running this method.")
+
+        # Verify required attributes
         if not hasattr(self, 'feature_order'):
             raise AttributeError("Hierarchical clustering must be performed before running this method.")
 
-        # Create the output directory
+        # Configuration parameters
+        conditions = self.params.get("conditions", ["bluelight"])  # Default condition list
+        axis_range = self.params.get("PC_axis_range", [-3, 3])
+
+        # Output directory setup
         parallel_coordinates_dir = os.path.join(self.output_directory, "Parallel_Coordinates")
         os.makedirs(parallel_coordinates_dir, exist_ok=True)
 
-        # Determine the significance threshold
-        significance_threshold = self.params.get("significance_threshold", 0.05)
+        # Use all features, including extreme values and non-significant ones
+        all_features = self.feature_order.copy()
 
-        # Identify significant features
-        pvalues_df = self.pvalues_df.T
-        significant_features = pvalues_df.columns[
-            (pvalues_df < significance_threshold).any(axis=0)
-        ].tolist()
+        # Define colors
+        control_color = "steelblue"
+        target_color = "darkkhaki"
 
-        if not significant_features:
-            print("No significant features found to plot.")
-            return
+        # Plot by condition
+        for condition in conditions:
+            # Select features relevant to the condition
+            condition_features = [f for f in all_features if f.endswith(f"_{condition}")]
 
-        # Filter significant features based on hierarchical clustering order
-        ordered_features = [f for f in self.feature_order if f in significant_features]
-
-        if not ordered_features:
-            print("No significant features found in the hierarchical clustering order.")
-            return
-
-        # Retrieve control class data
-        control_data = self.data_dict[self.control_class][self.feature_columns].select_dtypes(include=[np.number])
-
-        class_counter=1
-        # Plot control vs each target class
-        for target_class, target_data in self.data_dict.items():
-            if target_class == self.control_class:
+            if not condition_features:
+                print(f"⚠️ No features found for condition: {condition}")
                 continue
 
-            # Select numeric features only for the target class
-            target_data = target_data[self.feature_columns].select_dtypes(include=[np.number])
+            # Prepare control statistics
+            control_data = self.data_dict[self.control_class][condition_features]
+            control_median = control_data.median()
+            control_q1 = control_data.quantile(0.25)
+            control_q3 = control_data.quantile(0.75)
 
-            if control_data.empty or target_data.empty:
-                continue
+            # Create condition-specific output folder
+            condition_dir = os.path.join(parallel_coordinates_dir, f"{condition}")
+            os.makedirs(condition_dir, exist_ok=True)
 
-            # Combine control and target data
-            combined_data = pd.concat([
-                control_data[ordered_features].assign(Class=self.control_class),
-                target_data[ordered_features].assign(Class=target_class)
-            ])
+            # Plot control vs each target class
+            for target_class, target_df in tqdm(self.data_dict.items(), desc=f"Plotting ({condition})"):
+                if target_class == self.control_class:
+                    continue
 
-            # Plot the parallel coordinates
-            plt.figure(figsize=(15, 8))
-            pd.plotting.parallel_coordinates(
-                combined_data, class_column='Class', color=["steelblue", "darkkhaki"], alpha=0.7
-            )
-            plt.title(f"Parallel Coordinates: {self.control_class} vs {target_class}")
-            plt.xlabel("Features")
-            plt.ylabel("Feature Values")
-            plt.xticks(rotation=45, ha="right")
-            plt.tight_layout()
+                target_data = target_df[condition_features]
+                if target_data.empty or control_data.empty:
+                    continue
 
-            # Save the plot
-            output_path = os.path.join(parallel_coordinates_dir, f"Parallel_Coordinates_{self.control_class}_vs_{target_class}.png")
-            plt.savefig(output_path, dpi=300)
-            plt.close("all")
+                # Compute target class statistics (median + IQR)
+                target_median = target_data.median()
+                target_q1 = target_data.quantile(0.25)
+                target_q3 = target_data.quantile(0.75)
 
-            print(f"{class_counter}:Saved parallel coordinates plot for {self.control_class} vs {target_class} at {output_path}")
-            class_counter+=1
+                # Initialize the plot
+                plt.figure(figsize=(20, 10))
+                x = np.arange(len(condition_features))
 
-            del target_data, combined_data
-            gc.collect()
+                # Plot control median and IQR
+                plt.fill_between(x, control_q1, control_q3, color=control_color, alpha=0.3, label=f"{self.control_class} IQR")
+                plt.plot(x, control_median, color=control_color, linewidth=2, label=f"{self.control_class} Median")
+
+                # Plot target median and IQR
+                plt.fill_between(x, target_q1, target_q3, color=target_color, alpha=0.3, label=f"{target_class} IQR")
+                plt.plot(x, target_median, color=target_color, linewidth=2, label=f"{target_class} Median")
+
+                # Plot customization
+                plt.xticks(ticks=x, labels=condition_features, rotation=90, fontsize=8)
+                plt.title(f"Parallel Coordinates: {target_class} vs {self.control_class} | {condition}")
+                plt.xlabel("Features")
+                plt.ylabel("Normalized Values")
+                plt.ylim(axis_range)
+                plt.legend()
+                plt.tight_layout()
+
+                # Save the plot
+                sanitized_target_class = target_class.replace(" ", "_").replace("/", "_")
+                output_path = os.path.join(
+                    condition_dir, f"Parallel_Coordinates_{self.control_class}_vs_{sanitized_target_class}.pdf"
+                )
+                plt.savefig(output_path, format='pdf')
+                plt.close()
+
+                print(f" Saved plot for {self.control_class} vs {target_class} at {output_path}")
+                gc.collect()
+
+        print(" All parallel coordinates plots generated.")
 
     def plot_boxplots(self, batch_size=50):
         """
@@ -1626,7 +2271,10 @@ class SSA:
         }
 
         # Filter for all classes
-        filtered_data = self.data_dict
+        data=self.data
+        filtered_data = {
+            cls: df for cls, df in data.groupby(self.combined_class_column)
+        }
 
         # Define class ordering: control → negative → others → positive
         class_order = (
@@ -1731,3 +2379,166 @@ class SSA:
 
             # Explicit garbage collection
             gc.collect()
+
+    def interactive_waterfall_plot(self):
+        """
+        Generate per-feature interactive waterfall plots showing % change from control mean for each sample.
+        - Uses vertical lines instead of bars.
+        - Bins are assigned sequentially based on sorted DataFrame order.
+        - Preserves global sorting of bins across all classes.
+        - Saves one CSV per feature.
+        - Saves interactive Plotly HTML per feature.
+        - Stored in 'Analysis/Waterfall_Plots'.
+        """
+        output_dir = os.path.join(self.output_directory, "Waterfall_Plots")
+        os.makedirs(output_dir, exist_ok=True)
+
+        control_means = self.data_dict[self.control_class][self.feature_columns].mean()
+
+        class_color_map = {
+            cls: px.colors.qualitative.Set3[i % len(px.colors.qualitative.Set3)]
+            for i, cls in enumerate(self.data_dict.keys())
+        }
+
+        for feature in self.feature_columns:
+            sample_data = []
+            
+            for cls, df in self.data_dict.items():
+                if cls == self.control_class or df.empty:
+                    continue
+                for idx, value in df[feature].dropna().items():
+                    percent_change = ((value - control_means[feature]) / control_means[feature]) * 100
+                    sample_data.append({
+                        'class': cls,
+                        'percent_change': percent_change,
+                        'sample_id': f'{cls}_{idx}'
+                    })
+            
+            if not sample_data:
+                continue
+            
+            # Convert to DataFrame and sort as in CSV output
+            sample_df = pd.DataFrame(sample_data)
+            sample_df = sample_df.sort_values(by='percent_change', ascending=False).reset_index(drop=True)
+            
+            # Assign bins sequentially based on order in sorted DataFrame
+            sample_df['bin'] = sample_df.index
+
+            # Save CSV file
+            csv_path = os.path.join(output_dir, f"Waterfall_map_{feature}.csv")
+            sample_df.to_csv(csv_path, index=False)
+            print(f"Saved ordered sample data to: {csv_path}")
+
+            fig = go.Figure()
+
+            # **Single loop to plot all samples in sequential bin order**
+            for _, row in sample_df.iterrows():
+                fig.add_trace(go.Scatter(
+                    x=[row['bin'], row['bin']],  # Vertical line at each bin position
+                    y=[0, row['percent_change']],
+                    mode='lines',
+                    line=dict(color=class_color_map[row['class']], width=2),
+                    name=row['class'],  # Class name for legend
+                    hoverinfo='x+y+name'
+                ))
+
+            fig.update_layout(
+                title=f"Interactive Waterfall Plot - {feature}",
+                xaxis=dict(title="Binned Samples (Sorted)", showgrid=False, type="category"),
+                yaxis=dict(title="% Change from Control Mean", showgrid=True,
+                        range=[sample_df['percent_change'].min() - 5, sample_df['percent_change'].max() + 5]),
+                template="plotly_white",
+                height=600,
+                margin=dict(l=50, r=20, t=50, b=100),
+                hoverlabel=dict(font=dict(color='black'))
+            )
+
+            fig.write_html(os.path.join(output_dir, f"IWaterfall_plot_{feature}.html"))
+            print(f"Saved Interactive Waterfall plot: {feature}")
+
+        print("All Interactive Waterfall plots generated.")
+
+    def plot_feature_distributions(self):
+        """
+        Generates feature distribution plots:
+        - One plot per feature using raw data.
+        - Black dots for class medians.
+        - Silver-gray vertical lines for IQR.
+        - Classes sorted by median value (ascending).
+        - Horizontal dashed line for control median (#780B0B).
+        - Saves sorting order in CSV.
+        - Output: .svg files.
+        """
+        print("Generating feature distribution plots...")
+
+        # Output directory
+        output_dir = os.path.join(self.output_directory, "Feature_Distributions")
+        os.makedirs(output_dir, exist_ok=True)
+
+        for feature in self.feature_columns:
+            feature_data = []
+
+            for cls, df in self.data_dict.items():
+                if df.empty or feature not in df:
+                    continue
+                
+                values = df[feature].dropna()
+                if values.empty:
+                    continue
+                
+                median = np.median(values)
+                q1 = np.percentile(values, 25)
+                q3 = np.percentile(values, 75)
+
+                feature_data.append({
+                    'class': cls,
+                    'median': median,
+                    'q1': q1,
+                    'q3': q3
+                })
+
+            # Skip if no valid data
+            if not feature_data:
+                continue
+
+            # Convert to DataFrame & Sort by Median
+            feature_df = pd.DataFrame(feature_data)
+            feature_df = feature_df.sort_values(by='median', ascending=True).reset_index(drop=True)
+
+            # Save sorting order
+            csv_path = os.path.join(output_dir, f"Feature_Order_{feature}.csv")
+            feature_df.to_csv(csv_path, index=False)
+            print(f"Saved sorting order: {csv_path}")
+
+            # Extract control median
+            control_median = feature_df[feature_df["class"] == self.control_class]["median"].values
+            control_median = control_median[0] if len(control_median) > 0 else None
+
+            # Plot
+            fig, ax = plt.subplots(figsize=(10, 6))
+            for i, row in feature_df.iterrows():
+                ax.plot([i, i], [row["q1"], row["q3"]], color="silver", linewidth=2)  # IQR Line
+                ax.scatter(i, row["median"], color="black", zorder=3)  # Median Dot
+
+            # Control median line
+            if control_median is not None:
+                ax.axhline(y=control_median, color="#780B0B", linestyle="dashed", linewidth=1.5, label="Control Median")
+
+            # Labels & Formatting
+            ax.set_xticks(range(len(feature_df)))
+            ax.set_xticklabels(feature_df["class"], rotation=90, fontsize=8)
+            ax.set_ylabel(f"{feature} Value")
+            ax.set_title(f"Feature Distribution: {feature}")
+            ax.grid(axis='y', linestyle='--', alpha=0.5)
+            
+            # Save Plot
+            plot_path = os.path.join(output_dir, f"Feature_Distribution_{feature}.svg")
+            plt.tight_layout()
+            plt.savefig(plot_path, format="svg", dpi=300)
+            plt.close()
+
+            print(f"Saved plot: {plot_path}")
+
+        print("All feature distribution plots generated.")
+
+        

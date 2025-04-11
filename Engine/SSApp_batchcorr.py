@@ -60,7 +60,7 @@ class BatchProcessor:
         feature_columns = [col for col in self.df.columns if not col.startswith(("metadata_", "core_"))]
         return [col for col in feature_columns if col in self.tierset]
 
-    def batch_correct(self, method="mean"):
+    def batch_correct(self, method="proportional"):
         """
         Perform batch correction based on the selected method.
 
@@ -216,6 +216,7 @@ class BatchProcessor:
         # Define the subset of classes to be plotted
         selected_classes = [main_control] + negative_controls + positive_controls
 
+        
         # Filter the data to include only these classes
         before_df = before_df[before_df[self.class_column].isin(selected_classes)]
         after_df = after_df[after_df[self.class_column].isin(selected_classes)]
@@ -227,7 +228,7 @@ class BatchProcessor:
         # Assign unique colors per class (one color per class)
         base_palette = sns.color_palette("husl", len(selected_classes))
         class_color_mapping = {cls: base_palette[i] for i, cls in enumerate(selected_classes)}
-
+        
         try:
             fig, axes = plt.subplots(1, 2, figsize=(16, 8))
 
@@ -239,7 +240,7 @@ class BatchProcessor:
                 data=before_df,
                 ax=axes[0],
                 order=before_df["Class_Date"].unique(),
-                palette={cls: class_color_mapping[cls.split("_")[0]] for cls in before_df["Class_Date"].unique()},
+                palette = {cls: class_color_mapping.get(cls, "gray") for cls in after_df["Class_Date"].unique()},
                 width=0.25,
                 linewidth=1.2,
                 dodge=False,
@@ -259,7 +260,7 @@ class BatchProcessor:
                 data=after_df,
                 ax=axes[1],
                 order=after_df["Class_Date"].unique(),
-                palette={cls: class_color_mapping[cls.split("_")[0]] for cls in after_df["Class_Date"].unique()},
+                palette = {cls: class_color_mapping.get(cls, "gray") for cls in after_df["Class_Date"].unique()},
                 width=0.25,
                 linewidth=1.2,
                 dodge=False,

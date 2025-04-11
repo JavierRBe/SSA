@@ -10,6 +10,8 @@ import pandas as pd
 import numpy as np
 from scipy.stats import shapiro
 import scipy as scipy
+import matplotlib.pyplot as plt
+import os
 
 def get_metadata_columns(df, prefix='metadata_'):
     """
@@ -199,7 +201,7 @@ def _check_for_normality(feat):
 
     return _norm_cols_rlts
 
-def check_well_integrity(df):
+def check_well_integrity(df,well_type):
     """
     Check the integrity of well data, ensuring only wells with good integrity are kept.
     Filters only the feature columns (not prefixed with 'core_' or 'metadata_') in the feature dataframe.
@@ -212,27 +214,49 @@ def check_well_integrity(df):
     - feat_filtered (DataFrame): Filtered feature DataFrame containing data only for wells with good integrity.
     - meta_filtered (DataFrame): Filtered metadata DataFrame containing information only for wells with good integrity.
     """
+    if well_type=="6WP":
 
-    # Check if feat DataFrame contains 'core_well_id' column
-    if 'core_well_id' not in df.columns:
-        raise ValueError("'core_well_id' column is missing")
+        # Check if feat DataFrame contains 'core_well_id' column
+        if 'core_well_id' not in df.columns:
+            raise ValueError("'core_well_id' column is missing")
+        
+        # Check if meta DataFrame contains 'core_well_id', 'is_bad_well', and 'is_good_well' columns
+        required_columns = ['core_well_id','metadata_Is_bad_well']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            raise ValueError(f"{missing_columns} columns are required")
 
-    # Check if meta DataFrame contains 'core_well_id', 'is_bad_well', and 'is_good_well' columns
-    required_columns = ['core_well_id', 'metadata_is_good_well','metadata_Is_bad_well']
-    missing_columns = [col for col in required_columns if col not in df.columns]
-    if missing_columns:
-        raise ValueError(f"{missing_columns} columns are required")
+        # Filter out wells that are marked as bad or not marked as good
+        discarded_wells = df[(df['metadata_Is_bad_well'] != False)]
+        num_discarded_wells = len(discarded_wells)
+        print(f'{num_discarded_wells} wells were discarded')
 
-    # Filter out wells that are marked as bad or not marked as good
-    discarded_wells = df[(df['metadata_is_good_well'] != 1) & (df['metadata_Is_bad_well'] != False)]
-    num_discarded_wells = len(discarded_wells)
-    print(f'{num_discarded_wells} wells were discarded')
+        # Update meta DataFrame by removing discarded wells
+        df_filtered = df[(df['metadata_Is_bad_well'] == False)]
 
-    # Update meta DataFrame by removing discarded wells
-    df_filtered = df[(df['metadata_is_good_well'] == 1) & (df['metadata_Is_bad_well'] == False)]
+        # Filter feat DataFrame to include only wells present in the updated meta DataFrame
+        # Retain core_ and metadata_ columns as they are
+    else:
+        # Check if feat DataFrame contains 'core_well_id' column
+        if 'core_well_id' not in df.columns:
+            raise ValueError("'core_well_id' column is missing")
+        
+        # Check if meta DataFrame contains 'core_well_id', 'is_bad_well', and 'is_good_well' columns
+        required_columns = ['core_well_id', 'metadata_is_good_well','metadata_Is_bad_well']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            raise ValueError(f"{missing_columns} columns are required")
 
-    # Filter feat DataFrame to include only wells present in the updated meta DataFrame
-    # Retain core_ and metadata_ columns as they are
+        # Filter out wells that are marked as bad or not marked as good
+        discarded_wells = df[(df['metadata_is_good_well'] != 1) & (df['metadata_Is_bad_well'] != False)]
+        num_discarded_wells = len(discarded_wells)
+        print(f'{num_discarded_wells} wells were discarded')
+
+        # Update meta DataFrame by removing discarded wells
+        df_filtered = df[(df['metadata_is_good_well'] == 1) & (df['metadata_Is_bad_well'] == False)]
+
+        # Filter feat DataFrame to include only wells present in the updated meta DataFrame
+        # Retain core_ and metadata_ columns as they are
 
     return df_filtered
  
@@ -413,26 +437,63 @@ def outlier_inquisition(feat, tolerance=3):
     return feat
 
 
-def craft_well_keys(recap):
-    recap['core_well_id']=recap['metadata_filename']+'_'+recap['core_well_name']
+def craft_well_keys(recap,well_type):
+    if well_type=="6WP":
+        recap['core_well_id']=recap['metadata_filename']
+    else:
+        recap['core_well_id']=recap['metadata_filename']+'_'+recap['core_well_name']
     return recap
 
-def drop_wells_by_skeletons(df, threshold):
-    """
-    Drops wells from the dataframe where the value in 'metadata_n_skeletons'
-    is below the specified threshold.
+def drop_wells_by_skeletons(df, threshold,class_column_main,output_directory):
+        """
+        Drops wells from the dataframe where 'core_n_skeletons' is below the specified threshold.
+        After dropping, generates a bar plot showing the number of skeletons per class using the
+        class column specified in `class_column_main`.
 
-    Parameters:
-    - df (pd.DataFrame): The input dataframe.
-    - threshold (int or float): The threshold value for 'metadata_n_skeletons'.
+        Parameters:
+        - df (pd.DataFrame): The input dataframe.
+        - threshold (int or float): Minimum number of skeletons required to keep a well.
+        - output_directory (str): Directory to save the skeleton count plot.
+        - class_column_main (str): The column name that identifies the class (from params['class_column_main']).
 
-    Returns:
-    - pd.DataFrame: The dataframe with wells below the threshold dropped.
-    """
-    if 'core_n_skeletons' not in df.columns:
-        raise ValueError("'core_n_skeletons' column is missing from the dataframe.")
-    
-    return df[df['core_n_skeletons'] >= threshold].reset_index(drop=True)
+        Returns:
+        - pd.DataFrame: DataFrame with wells below the threshold dropped.
+        """
+
+        if 'core_n_skeletons' not in df.columns:
+            raise ValueError("'core_n_skeletons' column is missing from the dataframe.")
+
+        if class_column_main not in df.columns:
+            raise ValueError(f"'{class_column_main}' column is missing from the dataframe. Check params['class_column_main'].")
+
+        # Drop wells below threshold
+        filtered_df = df[df['core_n_skeletons'] >= threshold].reset_index(drop=True)
+
+        # Group by the dynamic class column and calculate total skeleton counts after filtering
+        skeletons_by_class = filtered_df.groupby(class_column_main)['core_n_skeletons'].sum()
+
+        # Create the output directory if needed
+        preprocessing_dir = os.path.join(output_directory, "Skeleton_count")
+        os.makedirs(preprocessing_dir, exist_ok=True)
+
+        # Plot the skeleton counts per class
+        plt.figure(figsize=(12, 6))
+        skeletons_by_class.sort_values().plot(kind='bar', color='steelblue')
+        plt.title('Skeleton Counts Per Class (After Filtering)')
+        plt.ylabel('Number of Skeletons')
+        plt.xlabel('Class')
+        plt.xticks(rotation=45, ha='right')
+        plt.grid(axis='y', linestyle='--', alpha=0.6)
+        plt.tight_layout()
+
+        # Save plot
+        plot_path = os.path.join(preprocessing_dir, "Skeleton_Counts_Per_Class.png")
+        plt.savefig(plot_path, dpi=300)
+        plt.close()
+
+        print(f" Skeleton count plot saved at: {plot_path}")
+
+        return filtered_df
 
 def filter_core_and_metadata_columns(df):
     """

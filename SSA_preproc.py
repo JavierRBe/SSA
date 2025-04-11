@@ -57,8 +57,8 @@ Batch Correction
 Options
 
     Batch Correction Options
-        - global_control_mean
-        - global_control_median
+        - mean
+        - median
         - ratio
         - proportional
         - ruv
@@ -80,8 +80,8 @@ import numpy as np
 from tqdm import tqdm  # For progress bars
 import gc  # For explicit garbage collection
 
-from Helper.SSApp_helper import SSApph
-from Engine.SSApp_batchcorr import SSAppbc
+import SSApp_helper as SSApph
+import SSApp_batchcorr as SSAppbc
 
 def preprocess_data(params_file):
     """
@@ -125,12 +125,16 @@ def preprocess_data(params_file):
     # Check for required columns
     print("Checking required columns...")
     required_columns = set(params['key_columns'])
+    well_type=params.get("well_type", "96WP")
+    if well_type=="6WP":
+        required_columns.discard('core_well_name')
+        required_columns.discard('metadata_is_good_well')
     missing_cols = required_columns - set(merged_df.columns)
     if missing_cols:
         raise ValueError(f"The following required columns are missing: {missing_cols}")
 
     print("Forging well keys...")
-    merged_df = SSApph.craft_well_keys(merged_df)
+    merged_df = SSApph.craft_well_keys(merged_df,well_type)
 
         # Ensure 'metadata_Time_of_run' exists in the metadata
     if 'metadata_Time_of_run' in merged_df.columns:
@@ -161,15 +165,16 @@ def preprocess_data(params_file):
     merged_df = feat_df.drop(columns=[col for col in feat_df.columns if col.startswith('core_well_id.')])
 
     conditions = params.get("conditions", [])
+    savepath = f"{input_folder}/Preprocessing"
     # Execute preprocessing steps
     print("Starting preprocessing...")
     steps = [
         ("Dropping NaN core_well_id rows", lambda df: SSApph.drop_nan_core_well_id(df)),
         ("Dropping rows with all NaN features", lambda df: SSApph.drop_rows_with_all_nan_features(df)),
         ("Aligning data by conditions", lambda df: SSApph.align_data_by_conditions(df, conditions)),
-        ("Dropping wells by number of skeletons", lambda df: SSApph.drop_wells_by_skeletons(df, params.get("skeletons_threshold", []))),
+        ("Dropping wells by number of skeletons", lambda df: SSApph.drop_wells_by_skeletons(df, params.get("skeletons_threshold", []), params.get("class_column_main", []),savepath)),
         ("Dropping features by keyword", lambda df: SSApph.drop_feat_by_keyword(df, params.get("drop_keywords", []))),
-        ("Checking well integrity", lambda df: SSApph.check_well_integrity(df)),
+        ("Checking well integrity", lambda df: SSApph.check_well_integrity(df,well_type)),
         ("Discarding columns with NaN/Inf values", lambda df: SSApph.discard_columns_by_nan_inf(df, params.get("nan_inf_threshold", 10))),
         ("Imputing missing values", lambda df: SSApph.impute_features(df, params.get("impute_method", "smart"))),
         ("Labelling metadata", lambda df: SSApph.transform_columns_to_labels(df)),
@@ -182,12 +187,14 @@ def preprocess_data(params_file):
         merged_df = step_func(merged_df)
         gc.collect()  # Explicit garbage collection after each step
 
+    merged_df.to_csv(f"{input_folder}/Preprocessing/DataBeforeBtchProc.csv")
+
     # Perform Batch Correction
     if params.get("Perform_batch_correction", False):
         print("Performing Batch Correction...")
 
         # Extract batch correction method and ensure it's valid
-        batch_correction_method = params.get("batch_correction_method", "mean")
+        batch_correction_method = params.get("batch_correction_method", "proportional")
         valid_methods = ["mean", "median", "ratio", "proportional"]
         if batch_correction_method not in valid_methods:
             raise ValueError(f"Invalid batch correction method: {batch_correction_method}")
@@ -215,21 +222,20 @@ def preprocess_data(params_file):
             savepath=savepath,
             batch_size=params.get("batch_size", 50)
         )
+        # Plot PCAs 
+        savepath = f"{input_folder}/Preprocessing/PCA"
+        batch_processor.plot_control_only_pca(
+            before_df=merged_df,
+                after_df=corrected_df,
+                savepath=savepath)
+        
+        batch_processor.plot_full_data_pca(
+            before_df=merged_df,
+                after_df=corrected_df,
+                savepath=savepath)
     else:
         corrected_df = merged_df.copy()
-
-        # Plot PCAs 
-    savepath = f"{input_folder}/Preprocessing/PCA"
-    batch_processor.plot_control_only_pca(
-        before_df=merged_df,
-            after_df=corrected_df,
-            savepath=savepath)
     
-    batch_processor.plot_full_data_pca(
-        before_df=merged_df,
-            after_df=corrected_df,
-            savepath=savepath)
-
     corrected_df_sorted=SSApph.reorder_columns(corrected_df)
     # Save the resulting DataFrame
     print("Saving the final DataFrame...")
@@ -237,7 +243,6 @@ def preprocess_data(params_file):
     output_path = os.path.join(input_folder, output_file)
     corrected_df_sorted.to_csv(output_path, index=False)
     print(f"Preprocessing complete. File saved at: {output_path}")
-
 
 if __name__ == "__main__":
     params_file = input("Enter the path to the JSON parameters file: ").strip()
