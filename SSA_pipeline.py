@@ -178,6 +178,18 @@ def run_analysis_pipeline(params_file):
     else:
         print("Skipping Waterfall plots...")
 
+    # Density Plots
+    if not params.get("avoid_kde", False):
+        try:
+            print("Generating KDE plots...")
+            #ssa.plot_waterfall()
+            ssa.generate_kde_plots()
+            ssa.interactive_3d_pca_with_class_kde()
+        except Exception as e:
+            print(f"Error during KDE plots generation: {e}")
+    else:
+        print("Skipping KDE plots...")
+
     # Feature Ditributions
 
     if not params.get("avoid_feature_distributions", False):
