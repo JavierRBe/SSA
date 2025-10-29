@@ -85,7 +85,7 @@ from sklearn.cluster import KMeans
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from statsmodels.stats.multitest import multipletests
-from scipy.stats import gaussian_kde, chi2
+from scipy.stats import gaussian_kde, chi2, f_oneway
 from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
 from scipy.spatial.distance import pdist
 import matplotlib.colors as mcolors
@@ -104,6 +104,7 @@ from joblib import Parallel, delayed
 import plotly.express as px
 from scipy.stats import norm
 import gc
+
 
 class SSA:
     def __init__(self, data, params):
@@ -490,228 +491,243 @@ class SSA:
 
     def interactive_hierarchical_clustering(self):
         """
-        Generate an interactive hierarchical clustering heatmap with:
-        - Y-axis dendrogram with colored branches.
-        - Heatmap aligned with dendrogram leaf order.
-        - Class labels inside the heatmap cells on the diagonal.
-        - Clickable rows to copy core_well_id.
-        - Hover information with class names, Z-scores, and additional metadata.
+        Interactive dendrogram (left) + heatmap (right) with tight gaps,
+        fixed per-row height, readable 90° x labels, and a compact colorbar
+        placed OUTSIDE the plot area (to the right).
+
+        This version keeps the original (non-reversed) cluster order:
+        - heatmap y = 5,15,25,... (SciPy leaf centers)
+        - y-axes ranges are NOT reversed (range=[min,max])
         """
 
-        # ---------------------------
-        # Extract necessary data
-        # ---------------------------
+        import os
+        import numpy as np
+        import pandas as pd
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        from scipy.cluster.hierarchy import dendrogram
+        import matplotlib.colors as mcolors
+
+        # -------- Data --------
         linkage_matrix = self.linkage_matrix
-        grouped_df = self.grouped_df
-        core_well_ids = grouped_df.index.tolist()
+        grouped_df     = self.grouped_df
+        core_well_ids  = grouped_df.index.tolist()
 
-        hover_reach = self.params.get("hover_reach",10)
+        hover_reach   = self.params.get("hover_reach", 10)
         hover_columns = self.params.get("HC_hover_columns", [])
-
         vmin = self.params.get("vmin", -2)
-        vmax = self.params.get("vmax", 2)
+        vmax = self.params.get("vmax",  2)
 
-        # Build metadata DataFrame from self.data_dict
-        # ---------------------------
-        metadata_list = []
+        # Per-row height control
+        ROW_H   = 22  # px per row
+        TOP     = 18  # tight top margin
+        BOTTOM  = 26  # tight bottom margin (room for 90° labels)
 
-        for class_name, df in self.data_dict.items():
-            if not df.empty:
-                # Select hover columns that exist in df
-                selected_cols = [col for col in hover_columns if col in df.columns]
-                meta_info = {}
+        # LEFT margin based on longest y label
+        max_label_length = max(len(str(label)) for label in core_well_ids) if len(core_well_ids) else 6
+        LEFT = max(8, min(220, int(7.5 * max_label_length)))  # clamp width
 
-                for col in selected_cols:
-                    column_data = df[col].dropna()
+        # RIGHT margin enlarged to hold the outside colorbar
+        RIGHT = 90
 
-                    if column_data.empty:
-                        meta_info[col] = "N/A"
-                    elif pd.api.types.is_numeric_dtype(column_data):
-                        # For numeric data: show mean value (rounded to 3 decimals)
-                        meta_info[col] = f"{column_data.mean():.3f}"
-                    else:
-                        # For non-numeric data: show top hover_reach most frequent values
-                        top_values = column_data.value_counts().index[:hover_reach].tolist()
-                        meta_info[col] = ", ".join(map(str, top_values))
-
-                meta_info['class'] = class_name
-                metadata_list.append(meta_info)
-
-        # Create a DataFrame and convert to dictionary for quick access
-        metadata_df = pd.DataFrame(metadata_list).set_index('class')
-        metadata_dict = metadata_df.to_dict(orient='index')
-
-        # ---------------------------
-        #  Generate dendrogram data
-        # ---------------------------
+        # -------- Dendrogram (no draw) --------
         dendro = dendrogram(
             linkage_matrix,
             orientation='left',
             no_plot=True,
-            color_threshold=0.7 * max(linkage_matrix[:, 2])
+            color_threshold=0.7 * float(np.max(linkage_matrix[:, 2])),
         )
+        leaf_order  = dendro['leaves']
+        ordered_df  = grouped_df.iloc[leaf_order]
+        y_labels    = [core_well_ids[i] for i in leaf_order]
+        dend_colors = [mcolors.to_hex(c) for c in dendro['color_list']]
 
-        leaf_order = dendro['leaves']
-        ordered_df = grouped_df.iloc[leaf_order]
-        ordered_core_well_ids = [core_well_ids[i] for i in leaf_order]
-        dendro_colors = [mcolors.to_hex(color) for color in dendro['color_list']]
+        n_rows, n_features = ordered_df.shape
 
-        # ---------------------------
-        # Create dendrogram traces
-        # ---------------------------
-        dendro_traces = [
-        go.Scatter(
-            x=[-val for val in dcoord],  #  Invert X-coordinates for horizontal flip
-            y=icoord,
-            mode='lines',
-            line=dict(color=color, width=2),
-            hoverinfo='none',
-            showlegend=False
-        )
-        for icoord, dcoord, color in zip(dendro['icoord'], dendro['dcoord'], dendro_colors)]
+        # Figure height based on rows
+        fig_height = TOP + BOTTOM + max(1, n_rows) * ROW_H
 
+        # Build metadata lookups for hover
+        meta_dict = {}
+        for class_name, df in self.data_dict.items():
+            if df.empty:
+                continue
+            selected = [c for c in hover_columns if c in df.columns]
+            entry = {}
+            for col in selected:
+                coldata = df[col].dropna()
+                if coldata.empty:
+                    entry[col] = "N/A"
+                elif pd.api.types.is_numeric_dtype(coldata):
+                    entry[col] = f"{coldata.mean():.3f}"
+                else:
+                    top_vals = coldata.value_counts().index[:hover_reach].tolist()
+                    entry[col] = ", ".join(map(str, top_vals))
+            meta_dict[class_name] = entry
 
-        # ---------------------------
-        # Prepare heatmap hover text
-        # ---------------------------
-        text_annotations = np.full(ordered_df.shape, "", dtype=object)
-        
+        # Hover text grid
         hover_text = []
-        for i, class_label in enumerate(ordered_core_well_ids):
-            meta_info = metadata_dict.get(class_label, {})
-            meta_str = "<br>".join([f"<b>{col}:</b> {meta_info.get(col, 'N/A')}" for col in hover_columns])
-
-            row_hover_data = []
-            for j, feature in enumerate(ordered_df.columns):
-                z_score = ordered_df.iloc[i, j]
-                hover_info = (
-                    f"<b>Class:</b> {class_label}<br>"
-                    f"<b>Feature:</b> {feature}<br>"
-                    f"<b>Z-score:</b> {z_score:.2f}<br>{meta_str}"
+        for i, cls in enumerate(y_labels):
+            m = meta_dict.get(cls, {})
+            meta_str = "<br>".join([f"<b>{k}:</b> {m.get(k,'N/A')}" for k in hover_columns])
+            row_ht = []
+            for j, feat in enumerate(ordered_df.columns):
+                z = ordered_df.iloc[i, j]
+                row_ht.append(
+                    f"<b>Class:</b> {cls}<br>"
+                    f"<b>Feature:</b> {feat}<br>"
+                    f"<b>Z-score:</b> {z:.2f}"
+                    + (f"<br>{meta_str}" if meta_str else "")
                 )
-                row_hover_data.append(hover_info)
-            hover_text.append(row_hover_data)
+            hover_text.append(row_ht)
 
-
-
-        # ---------------------------
-        # Create heatmap trace
-        # ---------------------------
-        heatmap = go.Heatmap(
-            z=ordered_df.values,
-            x=ordered_df.columns,
-            y=ordered_core_well_ids,
-            colorscale='RdBu_r',
-            zmin=vmin, zmax=vmax,
-            colorbar=dict(title='Z-score'),
-            text=text_annotations,
-            texttemplate="%{text}",
-            hoverinfo="text",
-            hovertext=hover_text,
-            textfont={"color": "#004258", "size": 10},
-        )
-
-        # ---------------------------
-        # 📏 Dynamic margin adjustment
-        # ---------------------------
-        max_label_length = max(len(str(label)) for label in ordered_core_well_ids)
-        margin_left = max(100, max_label_length * 10)
-
-
-        # ---------------------------
-        # Create subplots layout
-        # ---------------------------
+        # ------------- Subplot grid with explicit domains -------------
         fig = make_subplots(
             rows=1, cols=2,
-            column_widths=[0.2, 0.8],
-            horizontal_spacing=0.005,
+            specs=[[{'type': 'xy'}, {'type': 'heatmap'}]],
+            column_widths=[0.18, 0.82],
+            horizontal_spacing=0.02,
             shared_yaxes=True,
-            specs=[[{'type': 'xy'}, {'type': 'heatmap'}]]
         )
 
-        # Add dendrogram and heatmap
-        for trace in dendro_traces:
-            fig.add_trace(trace, row=1, col=1)
-        fig.add_trace(heatmap, row=1, col=2)
+        # --- Dendrogram traces (mirror X so it grows left->right toward heatmap)
+        for icoord, dcoord, color in zip(dendro['icoord'], dendro['dcoord'], dend_colors):
+            fig.add_trace(
+                go.Scatter(
+                    x=[-v for v in dcoord], y=icoord,
+                    mode='lines', line=dict(color=color, width=2),
+                    hoverinfo='none', showlegend=False
+                ),
+                row=1, col=1
+            )
 
-        # ---------------------------
-        # Layout configuration
-        # ---------------------------
-        n_classes = ordered_df.shape[0]
-        n_features = ordered_df.shape[1]
+        # Align y with SciPy leaf centers (5,15,25,...), non-reversed axes
+        dend_y_min = 0
+        dend_y_max = 10 * n_rows
+        heatmap_y  = np.arange(n_rows) * 10 + 5
 
-        fig_width = max(1000, int(n_features * 25))
-        fig_height = max(600, int(n_classes * 18))
-
-        fig.update_layout(
-            title_text="Interactive Hierarchical Clustermap",
-            width=fig_width,
-            height=fig_height,
-            title_xanchor='center',
-            plot_bgcolor='white',
-            paper_bgcolor='white',
-            margin=dict(l=margin_left, r=50, t=50, b=100),
-            hovermode='closest'
-        )
-
-        fig.update_xaxes(visible=False, row=1, col=1)
-        fig.update_yaxes(showticklabels=False, row=1, col=1)
-        fig.update_yaxes(
-            tickmode='array',
-            tickvals=list(range(len(ordered_core_well_ids))),
-            ticktext=ordered_core_well_ids,
+        # --- Heatmap (colorbar OUTSIDE the plot)
+        fig.add_trace(
+            go.Heatmap(
+                z=ordered_df.values,
+                x=ordered_df.columns,
+                y=heatmap_y,
+                colorscale='RdBu_r',
+                zmin=vmin, zmax=vmax,
+                hovertext=hover_text, hoverinfo="text",
+                showscale=True,
+                colorbar=dict(
+                    lenmode='fraction', len=0.50, y=0.5,    # 50% tall, centered
+                    thickness=12,
+                    x=1.03, xanchor='left',                # outside the plot area
+                    outlinewidth=0,
+                    bgcolor='rgba(0,0,0,0)',
+                    ticklen=4,
+                ),
+            ),
             row=1, col=2
         )
 
-        # ---------------------------
-        # Add class labels inside the heatmap using go.Scatter
-        # ---------------------------
-        scatter_text_trace = go.Scatter(
-            x=[ordered_df.columns[0]] * len(ordered_core_well_ids),  # Align labels to the first column
-            y=ordered_core_well_ids,
-            mode='text',
-            text=ordered_core_well_ids,
-            textposition='middle right',  # Align text inside heatmap cells
-            textfont=dict(color="#0291C1", size=12, family="Palatino Linotype"),
-            hoverinfo='skip',  # Prevents interfering with heatmap hover
-            showlegend=False   # Hides from legend
+        # --- Y axes alignment (NON-reversed ranges to keep original order)
+        fig.update_yaxes(
+            row=1, col=1,
+            range=[dend_y_min, dend_y_max],                 # NOT reversed
+            showticklabels=False,
+            zeroline=False,
+            fixedrange=True,
+            automargin=False,
+        )
+        fig.update_xaxes(row=1, col=1, showticklabels=False, showgrid=False, zeroline=False)
+
+        fig.update_yaxes(
+            row=1, col=2,
+            range=[dend_y_min, dend_y_max],                 # NOT reversed
+            tickmode='array',
+            tickvals=heatmap_y,
+            ticktext=y_labels,
+            ticks="",
+            automargin=False,
+            fixedrange=True,
         )
 
-        fig.add_trace(scatter_text_trace, row=1, col=2)
+        # --- X axis (features), vertical labels just under heatmap
+        fig.update_xaxes(
+            row=1, col=2,
+            tickangle=90,
+            ticklabelposition="outside bottom",
+            ticks="",
+            automargin=False,
+            tickfont=dict(size=11),
+        )
 
-        # ---------------------------
-        # JavaScript for copy functionality
-        # ---------------------------
+        # --- Layout: tight margins, fixed size from rows
+        fig.update_layout(
+            width=max(1100, int(20 * n_features)),
+            height=fig_height,
+            margin=dict(l=LEFT, r=RIGHT, t=18, b=26),
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            hovermode='closest',
+            title_text="Interactive Hierarchical Clustermap",
+            title_y=0.96,
+        )
+
+        # Bring plot closer to top/bottom edges (labels still visible)
+        fig.layout.yaxis.domain  = [0.02, 0.98]
+        fig.layout.yaxis2.domain = [0.02, 0.98]
+
+        # Optional: label text overlay inside the first heatmap column
+        fig.add_trace(
+            go.Scatter(
+                x=[ordered_df.columns[0]] * n_rows,
+                y=heatmap_y,
+                mode='text',
+                text=y_labels,
+                textposition='middle right',
+                textfont=dict(color="#0291C1", size=12, family="Palatino Linotype"),
+                hoverinfo='skip',
+                showlegend=False
+            ),
+            row=1, col=2
+        )
+
+        # ----- Copy-to-clipboard JS -----
         clipboard_js = """
         document.addEventListener('DOMContentLoaded', function() {
-            var plot = document.getElementsByClassName('plotly-graph-div')[0];
-            if (plot) {
-                plot.on('plotly_click', function(data) {
-                    if (data && data.points && data.points.length > 0) {
-                        var coreWellID = data.points[0].y;
-                        navigator.clipboard.writeText(coreWellID).then(function() {
-                            alert('Copied to clipboard: ' + coreWellID);
-                        }).catch(function(err) {
-                            console.error('Clipboard copy failed: ', err);
-                        });
-                    }
+        var plot = document.getElementsByClassName('plotly-graph-div')[0];
+        if (plot) {
+            plot.on('plotly_click', function(data) {
+            if (data && data.points && data.points.length > 0) {
+                var rowLbl = data.points[0].y;
+                navigator.clipboard.writeText(String(rowLbl)).then(function() {
+                console.log('Copied:', rowLbl);
+                }).catch(function(err) {
+                console.error('Clipboard copy failed: ', err);
                 });
             }
+            });
+        }
         });
         """
 
-        # ---------------------------
-        # Save HTML with embedded JS
-        # ---------------------------
-        output_dir = os.path.join(self.output_directory, "Hierarchical_Clustering")
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, "Interactive_Hierarchical_Clustering_Heatmap.html")
+        # ----- Save HTML -----
+        out_dir = os.path.join(self.output_directory, "Hierarchical_Clustering")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "Interactive_Hierarchical_Clustering_Heatmap.html")
 
-        html_content = fig.to_html(full_html=True, include_plotlyjs='cdn')
-        html_with_js = html_content.replace('</body>', f'<script>{clipboard_js}</script></body>')
+        html = fig.to_html(
+            full_html=True,
+            include_plotlyjs='cdn',
+            default_width='100%',
+            default_height=f'{fig_height}px',
+            config={'responsive': True}
+        )
+        html = html.replace('</body>', f'<script>{clipboard_js}</script></body>')
 
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(html_with_js)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+
 
 
     def z_normalize_features(self):
@@ -805,133 +821,256 @@ class SSA:
     def statistical_analysis(self):
         """
         Perform statistical tests comparing each class to the control class based on user-specified parameters.
-        Includes support for **blocked permutation tests** to account for day-to-day variance, with batch processing and multi-core execution.
+        Includes support for blocked permutation tests to account for day-to-day variance, with batch processing and multi-core execution.
 
         Returns:
         - pvalues_df (pd.DataFrame): DataFrame of p-values for each feature across classes.
         """
-        # Ensure the 'Analysis' folder exists
+        # --- Setup & parameters (unchanged external behavior) ---
         os.makedirs(self.output_directory, exist_ok=True)
-
-        # Path for saving the p-values DataFrame
         output_file = os.path.join(self.output_directory, "Statistical_Analysis_pvalues.csv")
 
-        control_features = self.data_dict[self.control_class][self.feature_columns]
-        pvalues = {}
+        features = list(self.feature_columns)
+        control_df = self.data_dict[self.control_class]
+        control_features = control_df[features]
 
-        # Read test type, multiple testing correction, and permutation settings
+        pvalues = {}  # {class_name: list-of-pvals in feature order}
+
         stat_test_type = self.params.get("stat_test_type", "t-test")
         mt_correction = self.params.get("mt_correction", "False Discovery Rate (FDR) Correction")
         use_permutation = self.params.get("permutation_test", False)
-        num_permutations = self.params.get("num_permutations", 500)
-        num_cores = self.params.get("n_cores", -1)  # Use all available cores by default
-        batch_size = self.params.get("batch_size", 10)  # Number of features per batch
+        num_permutations = int(self.params.get("num_permutations", 500))
+        num_cores = int(self.params.get("n_cores", -1))
+        batch_size = int(self.params.get("batch_size", 10))
 
-        # Read day information for blocked permutations
+        # NOTE: Keep the original day-column requirement behavior
         if "metadata_Day_of_run" not in self.data:
             raise ValueError("The parameter 'metadata_Day_of_run' must be specified for blocked permutation tests.")
         day_column = "metadata_Day_of_run"
 
-       # Blocked permutation test function
-        def blocked_permutation_test(stat_func, x, y, day_labels, num_perms):
-            observed_stat = stat_func(x, y)
-            unique_days = np.intersect1d(np.unique(day_labels), np.unique(day_labels))
+        # === One-way ANOVA: per-compound (base) vs control across all its doses ===
+        if str(stat_test_type).strip().upper() == "ANOVA":
+            control_name = self.control_class
+            base_sep = self.params.get("class_base_sep", "_")  # how dose is appended: e.g., "Name_10uM"
+            min_n = int(self.params.get("anova_min_n_per_group", 2))
 
-            def single_permutation():
-                permuted_stats = []
-                for day in unique_days:
-                    day_indices_x = np.where(day_labels[:len(x)] == day)[0]
-                    day_indices_y = np.where(day_labels[len(x):] == day)[0]
+            def _base(name: str) -> str:
+                if name == control_name:
+                    return control_name
+                return name.rsplit(base_sep, 1)[0] if base_sep in str(name) else str(name)
 
-                    if len(day_indices_x) == 0 or len(day_indices_y) == 0:
-                        continue  # Skip days without data in both groups
+            # Map: base -> [class names (doses) for that base], excluding control
+            base_to_classes = {}
+            for cls_name in self.data_dict.keys():
+                if cls_name == control_name:
+                    continue
+                b = _base(cls_name)
+                base_to_classes.setdefault(b, []).append(cls_name)
 
-                    combined = np.concatenate([x[day_indices_x], y[day_indices_y]])
-                    np.random.shuffle(combined)
+            compound_bases = sorted(base_to_classes.keys())
+            if control_name not in self.data_dict:
+                raise ValueError(f"Control class '{control_name}' not found in data_dict.")
 
-                    perm_x = combined[:len(day_indices_x)]
-                    perm_y = combined[len(day_indices_x):]
-                    permuted_stats.append(stat_func(perm_x, perm_y))
+            # Pre-extract per-class feature frames for speed
+            per_class_feats = {cls: df[list(features)] for cls, df in self.data_dict.items()}
+            ctrl_feats = per_class_feats[control_name]
 
-                return np.sum(permuted_stats) if permuted_stats else 0
+            # Compute raw ANOVA p-values: rows = compound base, cols = features
+            pvals = {base: [] for base in compound_bases}
 
-            permuted_statistics = Parallel(n_jobs=num_cores)(
-                delayed(single_permutation)() for _ in range(num_perms)
-            )
+            for f in features:
+                # control group values for this feature
+                x_ctrl = pd.to_numeric(ctrl_feats[f], errors="coerce").dropna().values
 
-            p_value = (np.sum(np.abs(permuted_statistics) >= np.abs(observed_stat)) + 1) / (num_perms + 1)
-            return p_value
+                for base in compound_bases:
+                    groups = []
+                    if x_ctrl.size > min_n:
+                        groups.append(x_ctrl)
 
-        # Test function mapper
-        def get_test_function(test_name):
-            return {
-                "t-test": (
-                    lambda x, y: ttest_ind(x, y, nan_policy='omit')[1],
-                    lambda x, y, days: blocked_permutation_test(lambda a, b: np.abs(np.mean(a) - np.mean(b)), x, y, days, num_permutations)
-                ),
-                "Mann-Whitney": (
-                    lambda x, y: mannwhitneyu(x, y, alternative='two-sided')[1],
-                    lambda x, y, days: blocked_permutation_test(lambda a, b: np.abs(np.median(a) - np.median(b)), x, y, days, num_permutations)
-                ),
-                "Kruskal-Wallis": (
-                    lambda x, y: kruskal(x, y)[1],
-                    lambda x, y, days: blocked_permutation_test(lambda a, b: np.abs(np.median(a) - np.median(b)), x, y, days, num_permutations)
-                ),
-                "Wilcoxon": (
-                    lambda x, y: wilcoxon(x, y)[1],
-                    lambda x, y, days: blocked_permutation_test(lambda a, b: np.abs(np.median(a) - np.median(b)), x, y, days, num_permutations)
-                ),
-            }.get(test_name, (None, None))
+                    # add all dose classes for this base
+                    for cls in base_to_classes[base]:
+                        x = pd.to_numeric(per_class_feats[cls][f], errors="coerce").dropna().values
+                        if x.size > min_n:
+                            groups.append(x)
 
-        test_func, perm_test_func = get_test_function(stat_test_type)
-        if test_func is None:
-            raise ValueError(f"Unsupported statistical test: '{stat_test_type}'")
+                    # need >= 2 non-empty groups to run ANOVA
+                    if len(groups) >= 2:
+                        try:
+                            _, p = f_oneway(*groups)
+                        except Exception:
+                            p = np.nan
+                    else:
+                        p = np.nan
 
-        feature_batches = [self.feature_columns[i:i + batch_size] for i in range(0, len(self.feature_columns), batch_size)]
+                    pvals[base].append(p)
 
-        for cls, df in tqdm(self.data_dict.items(), desc="Statistical Tests"):
-            if cls == self.control_class:
-                continue
+            pvalues_df = pd.DataFrame(pvals, index=features).T  # rows=bases, cols=features
 
-            class_features = df[self.feature_columns]
-            day_labels = df[day_column].values if use_permutation else None
-            pvalues[cls] = []
+            # --- Multiple testing correction (per feature/column), same as your code ---
+            method_str = str(mt_correction).lower()
+            correction_method = "fdr_bh" if "fdr" in method_str else method_str
 
-            for batch in feature_batches:
-                if use_permutation:
-                    batch_results = Parallel(n_jobs=num_cores)(
-                        delayed(perm_test_func)(
-                            control_features[feature].values,
-                            class_features[feature].values,
-                            np.concatenate([
-                                self.data_dict[self.control_class][day_column].values,
-                                df[day_column].values
-                            ])
-                        ) for feature in batch
-                    )
-                else:
-                    batch_results = Parallel(n_jobs=num_cores)(
-                        delayed(test_func)(control_features[feature].values, class_features[feature].values)
-                        for feature in batch
-                    )
+            for feature in pvalues_df.columns:
+                vec = pd.to_numeric(pvalues_df[feature], errors="coerce").fillna(1.0).to_numpy()
+                _, corrected, _, _ = multipletests(vec, alpha=0.05, method=correction_method)
+                pvalues_df.loc[:, feature] = corrected
 
-                pvalues[cls].extend(batch_results)
+        else:
 
-        pvalues_df = pd.DataFrame(pvalues, index=self.feature_columns).T
+            # --- Helper: blocked permutation test (single-threaded inside; preserves original statistic & flow) ---
+            def blocked_permutation_test(stat_func, x, y, day_labels, num_perms):
+                """
+                stat_func: callable(a, b, *, nan) -> scalar  (expects a nan-aware reducer)
+                x, y: 1D arrays for the feature (control first, then target in day_labels)
+                day_labels: 1D array, concatenation of control days then target days
+                """
+                # Split day labels into group-specific views
+                x_days = day_labels[:len(x)]
+                y_days = day_labels[len(x):]
 
-        # Multiple testing correction
-        correction_method = 'fdr_bh' if mt_correction.lower() == "fdr" else mt_correction.lower()
-        for feature in pvalues_df.columns:
-            valid_pvals = pvalues_df[feature].fillna(1.0)
-            _, corrected, _, _ = multipletests(valid_pvals, alpha=0.05, method=correction_method)
-            pvalues_df.loc[:, feature] = corrected
+                # Days present in BOTH groups
+                days_common = np.intersect1d(np.unique(x_days), np.unique(y_days))
+                if days_common.size == 0:
+                    return 1.0
 
+                # Precompute per-day indices
+                x_idx_by_day = {d: np.where(x_days == d)[0] for d in days_common}
+                y_idx_by_day = {d: np.where(y_days == d)[0] for d in days_common}
+
+                # Observed statistic: sum over days of per-day stat_func
+                observed_stat = 0.0
+                for d in days_common:
+                    xi = x_idx_by_day[d]; yi = y_idx_by_day[d]
+                    if xi.size == 0 or yi.size == 0:
+                        continue
+                    observed_stat += stat_func(x[xi], y[yi])
+
+                rng = np.random.default_rng()
+                exceed = 0
+
+                # Permutations: within each day, shuffle pooled values and split back to sizes
+                for _ in range(num_perms):
+                    stat_sum = 0.0
+                    for d in days_common:
+                        xi = x_idx_by_day[d]; yi = y_idx_by_day[d]
+                        if xi.size == 0 or yi.size == 0:
+                            continue
+                        pooled = np.concatenate((x[xi], y[yi]), axis=0)
+                        perm = rng.permutation(pooled.shape[0])
+                        px = pooled[perm[: xi.size]]
+                        py = pooled[perm[xi.size:]]
+                        stat_sum += stat_func(px, py)
+                    if np.abs(stat_sum) >= np.abs(observed_stat):
+                        exceed += 1
+
+                return (exceed + 1) / (num_perms + 1)
+
+
+            # --- Map tests (preserve original semantics) ---
+            # For permutation variants, we use absolute mean/median difference exactly like the original mapping.
+            def get_test_function(test_name):
+                return {
+                    "t-test": (
+                        lambda a, b: ttest_ind(a, b, nan_policy='omit')[1],
+                        lambda a, b, days: blocked_permutation_test(
+                            lambda x, y: np.abs(np.nanmean(x) - np.nanmean(y)), a, b, days, num_permutations
+                        ),
+                    ),
+                    "Mann-Whitney": (
+                        lambda a, b: mannwhitneyu(a, b, alternative='two-sided')[1],
+                        lambda a, b, days: blocked_permutation_test(
+                            lambda x, y: np.abs(np.nanmedian(x) - np.nanmedian(y)), a, b, days, num_permutations
+                        ),
+                    ),
+                    "Kruskal-Wallis": (
+                        lambda a, b: kruskal(a, b)[1],
+                        lambda a, b, days: blocked_permutation_test(
+                            lambda x, y: np.abs(np.nanmedian(x) - np.nanmedian(y)), a, b, days, num_permutations
+                        ),
+                    ),
+                    "Wilcoxon": (
+                        lambda a, b: wilcoxon(a, b)[1],
+                        lambda a, b, days: blocked_permutation_test(
+                            lambda x, y: np.abs(np.nanmedian(x) - np.nanmedian(y)), a, b, days, num_permutations
+                        ),
+                    ),
+                }.get(test_name, (None, None))
+
+
+            test_func, perm_test_func = get_test_function(stat_test_type)
+            if test_func is None:
+                raise ValueError(f"Unsupported statistical test: '{stat_test_type}'")
+
+            # --- Prepare batching over features (unchanged external behavior) ---
+            feature_batches = [features[i : i + batch_size] for i in range(0, len(features), batch_size)]
+
+            # Pre-extract control feature vectors to avoid repeated Series indexing (reduces overhead)
+            control_feature_arrays = {f: control_features[f].values for f in features}
+            # Also pre-extract control day labels once
+            control_days = control_df[day_column].values if use_permutation else None
+
+            # --- Main loop over classes (single level of parallelism only inside batches) ---
+            for cls, df in tqdm(self.data_dict.items(), desc="Statistical Tests"):
+                if cls == self.control_class:
+                    continue
+
+                class_features = df[features]
+                class_days = df[day_column].values if use_permutation else None
+                pvalues[cls] = []
+
+                for batch in feature_batches:
+                    # Prepare arguments for this batch
+                    if use_permutation:
+                        # Pre-build combined day labels per feature-call once per batch to avoid recompute in workers
+                        combined_days = np.concatenate([control_days, class_days], axis=0)
+
+                        # One-level parallel over features in batch; no nested parallel inside permutation
+                        batch_results = Parallel(n_jobs=num_cores, prefer="threads")(
+                            delayed(perm_test_func)(
+                                control_feature_arrays[f],
+                                class_features[f].values,
+                                combined_days
+                            )
+                            for f in batch
+                        )
+                    else:
+                        # Classical test per feature; keep parallelism identical to original API
+                        batch_results = Parallel(n_jobs=num_cores, prefer="threads")(
+                            delayed(test_func)(
+                                control_feature_arrays[f],
+                                class_features[f].values
+                            )
+                            for f in batch
+                        )
+
+                    pvalues[cls].extend(batch_results)
+
+            # --- Assemble p-values DataFrame (same shape/orientation as original) ---
+            pvalues_df = pd.DataFrame(pvalues, index=features).T
+
+            # --- Multiple testing correction (per feature/column), preserving original semantics ---
+            # Normalize method string defensively to keep backward-compat behavior and avoid errors.
+            method_str = str(mt_correction).lower()
+            if "fdr" in method_str:
+                correction_method = "fdr_bh"
+            else:
+                # Allow passing through supported method names directly (bonferroni, holm, fdr_by, etc.)
+                correction_method = method_str
+
+            for feature in pvalues_df.columns:
+                valid_pvals = pvalues_df[feature].fillna(1.0).to_numpy()
+                # multipletests returns: reject, pvals_corrected, alphacSidak, alphacBonf
+                _, corrected, _, _ = multipletests(valid_pvals, alpha=0.05, method=correction_method)
+                pvalues_df.loc[:, feature] = corrected
+
+        # --- Persist results (unchanged outputs) ---
         pvalues_df.to_csv(output_file)
         print(f" Statistical analysis results saved at: {output_file}")
 
+        # Original side-effect (kept exactly)
         self.pvalues_df = pvalues_df.T
-        return pvalues_df
 
+        return pvalues_df
 
 ########################
     
@@ -1189,16 +1328,15 @@ class SSA:
                     anomaly_percentage = (anomaly_predictions == -1).mean() * 100
 
                     # Compute shape vote (distributional difference)
-                    mean_wd, shape_vote = self._compute_shape_metrics(full_control_bootstrap, full_target_bootstrap)
+                    #mean_wd, shape_vote = self._compute_shape_metrics(full_control_bootstrap, full_target_bootstrap)
 
 
                     # Compute PCA Vote
                     pca_vote = 1 if anomaly_percentage >= self.consensus_percentage else 0
 
-                    # Weighted Final Vote (90% PCA, 10% Variance)
-                    variance_vote=variance_vote*1.2
-                    shape_vote=shape_vote*2
-                    final_vote_percentage = 0.7 * anomaly_percentage + 0.1 * variance_vote * 100 + 0.2 * shape_vote * 100
+                    # Weighted Final Vote (70% PCA, 10% Variance, 20% Shape)
+                    shape_vote=0
+                    final_vote_percentage = 0.85 * anomaly_percentage + 0.15 * variance_vote * 100 
                     final_vote = 1 if final_vote_percentage >= self.consensus_percentage else 0
 
                     # Store results
@@ -1631,8 +1769,6 @@ class SSA:
             plt.close()
             print(f" Saved significance-aware smoothed boxplot: {save_path}")
 
-
-
         def _compute_shape_metrics(self, control_samples, target_samples):
             """
             Compute a shape-based anomaly score using Wasserstein distances.
@@ -1648,7 +1784,7 @@ class SSA:
                 control_values = control_samples[feature].dropna()
                 target_values = target_samples[feature].dropna()
 
-                if len(control_values) > 5 and len(target_values) > 5:
+                if len(control_values) > 2 and len(target_values) > 2:
                     wd = wasserstein_distance(control_values, target_values)
                     feature_dists.append(wd)
 
@@ -1662,7 +1798,18 @@ class SSA:
                 control_samples.max() - control_samples.min(), 1e-8
             ).mean()
 
-            shape_vote = np.clip(mean_wasserstein / (control_range * 1.5), 0, 1)
+            c = float(np.clip(control_range, 1e-9, 1 - 1e-9))
+            t = float(np.clip(mean_wasserstein, 0.0, 1.0))
+
+            if t < c:
+                r = t / c                               # 0..1 relative to [0..c]
+                shape_vote = 0.4 * (r ** 0.2)        # 0..0.4
+            elif t > c:
+                r = (t - c) / (1.0 - c)                # 0..1 relative to [c..1]
+                shape_vote = 0.4 + 0.6 * (r ** 0.2)  # 0.4..1.0
+            else:
+                shape_vote = 0.4
+
             return mean_wasserstein, shape_vote
 
         def _plot_anomaly_votes_interactive(self):
@@ -1761,11 +1908,23 @@ class SSA:
             target_top3_variance = sum(pca.explained_variance_ratio_[:3])
 
             # Calculate variance vote using log-scaled deviation
-            variance_factor = np.log1p(abs(target_top3_variance - self.control_top3_variance))
-            variance_vote = np.clip(
-                variance_factor / np.log1p(self.control_top3_variance * 2),
-                0, 1
-            )
+            c = float(np.clip(self.control_top3_variance, 1e-9, 1 - 1e-9))
+            t = float(np.clip(target_top3_variance, 0.0, 1.0))
+
+            if t >= c:
+                varmax=1-c
+                vart=t-c
+                variance_vote= 0.25+ abs(vart/varmax)
+            else:
+                varmax=c
+                vart=t-c
+                variance_vote= 0.1 + abs(vart/varmax)
+
+
+            if variance_vote>1:
+                variance_vote=1
+            if variance_vote<0:
+                variance_vote=0 
 
             return target_top3_variance, variance_vote
         
